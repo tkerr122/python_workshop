@@ -2,9 +2,15 @@
 from osgeo import gdal
 from tqdm import tqdm
 from scipy.ndimage import grey_dilation
-import numpy as np
-import os, shutil
+import os, shutil, argparse
 gdal.UseExceptions()
+
+"""I have written this script to be a command-line utility for creating a single merged slope raster
+from a DEM, or folder of DEMs. 
+====================================================================================================
+-p option: path to DEM, or folder of DEMs.
+-od option: path to output folder for the slope raster
+"""
 
 def get_raster_info(raster_path):
     """Opens a raster at the given path.
@@ -24,6 +30,15 @@ def get_raster_info(raster_path):
     return ds, xsize, ysize, transform, projection
 
 def create_slope(dem_path, output_dir):
+    """Creates a slope raster from a given DEM.
+
+    Args:
+        dem_path (str): Path to DEM.
+        output_dir (str): Path to output directory.
+    
+    Returns:
+        str: Path to the slope raster
+    """
     # Create slope raster
     name = os.path.splitext(os.path.basename(dem_path))[0]
     slope_path = os.path.join(output_dir, f"{name}_slope.tif")
@@ -32,7 +47,17 @@ def create_slope(dem_path, output_dir):
                                               slopeFormat="degree")
     gdal.DEMProcessing(slope_path, dem_path, processing="slope", options=slope_options)
     
+    return slope_path
+    
 def merge_slope(slope_dir):
+    """Uses GDAL BuildVRT and GDAL Translate tools to merge all slope rasters in a given folder.
+
+    Args:
+        slope_dir (str): Path to slope folder to merge.
+
+    Returns:
+        str: Path to merged slope raster.
+    """
     # Create filenames, build VRT
     slope_rasters = [os.path.join(slope_dir, f) for f in os.listdir(slope_dir)]
     vrt_path = f"{slope_dir}.vrt"
@@ -51,6 +76,11 @@ def merge_slope(slope_dir):
     return merged_path
 
 def dilate_slope(merged_slope_path):
+    """Uses the SciPy Grey Dilation tool to emphasize high slope values in the given slope raster
+
+    Args:
+        merged_slope_path (str): Path to slope raster to dilate.
+    """
     # Load slope raster
     print("Smoothing slope...")
     
@@ -85,11 +115,19 @@ def main():
     # Setup
     print("\nCreating slope rasters...")
     
+    # Create argument parser
+    parser = argparse.ArgumentParser(description="Script for creating slope raster from folder of DTMs")
+    parser.add_argument("-p", "--dem-path", type=str, help="Path to DEM or folder of DEMs", required=True)
+    parser.add_argument("-od", "--output-dir", type=str, help="Path to output slope folder", required=True)
+    
+    # Parse args
+    args = parser.parse_args()
+    
     # Set up variables    
-    dem_path = "/gpfs/glad1/Theo/Data/Lidar/DTMs/AZ_BlackRock_DTM"
-    slope_dir = "/gpfs/glad1/Theo/Data/Lidar/CHM_cleaning/Slope/AZ_BlackRock_slope"
+    dem_path = args.dem_path
+    slope_dir = args.output_dir
     os.makedirs(slope_dir, exist_ok=True)
-        
+    
     # Loop through DEM folder and create slope rasters
     if os.path.isdir(dem_path):
         dems = os.listdir(dem_path)
@@ -117,9 +155,9 @@ def main():
         dilate_slope(merged_path)
     
     else:
-        create_slope(dem_path, slope_dir)    
-        merged_path = merge_slope(slope_dir)
-        dilate_slope(merged_path)
+        # Create slope, 
+        slope_path = create_slope(dem_path, slope_dir)
+        dilate_slope(slope_path)
     
     print("Done")
     
