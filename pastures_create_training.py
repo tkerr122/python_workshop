@@ -2,6 +2,7 @@
 
 # Global imports/env settings
 from osgeo import gdal, ogr
+from datetime import datetime
 import geopandas as gpd
 import os, shutil
 gdal.UseExceptions()
@@ -13,39 +14,15 @@ from tile_training import tile_training
 # Define custom functions
 # =========================
 def rasterize(input_file, output_tiff, pixel_size, burn_value):
-    # Open dataset
-    dataset = ogr.Open(input_file)
-    layer = dataset.GetLayer() 
-    
-    # Define raster properties
-    x_min, x_max, y_min, y_max = layer.GetExtent()
-    x_res = int((x_max - x_min) / pixel_size)
-    y_res = int((y_max - y_min) / pixel_size)
-    target_ds = gdal.GetDriverByName("GTiff").Create(output_tiff, x_res, y_res, 1, gdal.GDT_Byte, options=["COMPRESS=LZW", "BIGTIFF=YES"])
-    target_ds.SetGeoTransform((x_min, pixel_size, 0, y_max, 0, -pixel_size))
-    
-    # Set projection
-    srs = layer.GetSpatialRef()
-    target_ds.SetProjection(srs.ExportToWkt())
-    
-    # Set band nodata value
-    band = target_ds.GetRasterBand(1)
-    band.SetNoDataValue(255)
-
-    # Rasterize dataset
-    gdal.RasterizeLayer(target_ds, [1], layer, burn_values=[burn_value])
-    
-    # Fill nodata
-    arr = band.ReadAsArray()
-    arr = (arr == 1).astype("uint8")
-    band.WriteArray(arr)
+    # Rasterize the input file
+    rasterize_options = gdal.RasterizeOptions(format="GTiff",
+                                              burnValues=burn_value,
+                                              xRes=pixel_size,
+                                              yRes=pixel_size)
+    gdal.Rasterize(output_tiff, input_file, options=rasterize_options)
     
     print(f"Rasterized {os.path.basename(input_file)}...")
     
-    band = None
-    target_ds = None
-    dataset = None
-
     
 # =========================
 # Extract the training
@@ -57,7 +34,7 @@ def extract_training(training_shp, output_tiff, crs, pixel_size, buffer_size):
     training_temp = f"{os.path.splitext(output_tiff)[0]}.geojson"
     
     # Buffer the training
-    training_buffered = training.buffer(buffer_size, cap_style="square")
+    training_buffered = training.buffer(buffer_size, cap_style="flat")
     
     # Reproject
     training_buffered.to_file(training_temp, driver="GeoJSON")
@@ -81,27 +58,50 @@ def main():
     # Set up variables
     crs = "EPSG:3857"
     pixel_size = 4.77731426716
+    output_dir = "/gpfs/glad1/Exch/Antoine/Pastures_training/Output_training"
+    
+    # Move older folders to "Previous versions" folder
+    for file in os.listdir(output_dir):
+        path = os.path.join(output_dir, file)
+        
+        if os.path.isdir(path) and file != "Previous_versions":
+            shutil.move(path, os.path.join(output_dir, "Previous_versions"))
+            print(f"Moved {file} to \"Previous_versions\"...")
     
     # Load in training data files
-    output_dir = "/gpfs/glad1/Exch/Antoine/Pastures_training/Output_training_v2"
-    os.makedirs(output_dir, exist_ok=True)
-    pasture_path = "/gpfs/glad1/Exch/Antoine/Pastures_training/linear_features/linear_features_065W_13S_px512_r4_c4.shp"
+    date = datetime.now().strftime("%b%d_%Y").lower()
+    current_output_dir = os.path.join(output_dir, f"Training_{date}")
+    os.makedirs(current_output_dir, exist_ok=True)
+    # antoine_pastures = "/gpfs/glad1/Exch/Antoine/Pastures_training/linear_features/linear_features_01082026/linear_features_01082026.shp"
+    theo_pastures = "/gpfs/glad1/Theo/Shapefiles/Pastures_training/Pastures.shp"
     
     # Extract pastures training
-    pasture_tiff = os.path.join(output_dir, "Pasture.tif")
-    extract_training(pasture_path, pasture_tiff, crs, pixel_size, buffer_size=10)
+    # antoine_pasture_tiff = os.path.join(current_output_dir, "Antoine_pasture.tif")
+    theo_pasture_tiff = os.path.join(current_output_dir, "Theo_pasture.tif")
+    # extract_training(antoine_pastures, antoine_pasture_tiff, crs, pixel_size, buffer_size=10)
+    extract_training(theo_pastures, theo_pasture_tiff, crs, pixel_size, buffer_size=10)
     
     # Tile the training
-    output_tiled = os.path.join(output_dir, "tiled")
+    output_tiled = os.path.join(current_output_dir, "tiled")
     os.makedirs(output_tiled, exist_ok=True)
-    planet_tile_list = tile_training(pasture_tiff, output_tiled, crs)
+    # antoine_tile_list = tile_training(antoine_pasture_tiff, output_tiled, crs)
+    theo_tile_list = tile_training(theo_pasture_tiff, output_tiled, crs)
     
     # Write out planet tile list
-    tiles_txt = os.path.join(output_dir, "planet_tiles.txt")
+    planet_tile_list = []
+    # planet_tile_list.extend(antoine_tile_list)
+    planet_tile_list.extend(theo_tile_list)
+    planet_tile_list = sorted(set(planet_tile_list))
+    
+    tiles_txt = os.path.join(current_output_dir, "planet_tiles.txt")
     
     with open(tiles_txt, "w") as f:
         f.write("location\n")
         f.writelines(f"{tile}\n"for tile in planet_tile_list)
+        
+    # Cleanup
+    # os.remove(antoine_pasture_tiff)
+    os.remove(theo_pasture_tiff)
 
     print()
     print("=".center(columns, "="))
