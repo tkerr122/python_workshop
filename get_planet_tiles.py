@@ -14,6 +14,7 @@ intersect with.
 -t option: path to the output TXT file which will have the planet tiles
 
 """
+
 # =========================
 # Define custom functions
 # =========================
@@ -93,8 +94,5 @@ def main():
     
     print("done")
     
-# =========================
-# Get the planet tiles
-# =========================
 if __name__ == "__main__":
     main()

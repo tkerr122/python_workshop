@@ -7,6 +7,14 @@ from tqdm import tqdm
 import os, shutil, argparse
 gdal.UseExceptions()
 
+"""This script is a command-line utility to split a given raster or folder of rasters
+into tiles matching the planet tile scheme.
+================================================
+-p option: path to the raster or folder of rasters to be processed
+-od option: path to the output directory for the tiles
+-crs: crs for the output tiled rasters
+"""
+
 # Local imports
 from get_planet_tiles import get_planet_tiles
 
@@ -121,7 +129,6 @@ def main():
     print()
     print("=".center(columns, "="))
     print()
-
 
 if __name__ == "__main__":
     main()
