@@ -1,7 +1,7 @@
 # Theo Kerr on 12/02/2025
 
 # Global imports/env settings
-from osgeo import gdal, ogr
+from osgeo import gdal
 from datetime import datetime
 import geopandas as gpd
 import os, shutil
@@ -23,27 +23,44 @@ def rasterize(input_file, output_tiff, pixel_size, burn_value):
     
     print(f"Rasterized {os.path.basename(input_file)}...")
     
+def load_files(input_dir):
+    # Loop through input directory and create list of files
+    files = os.listdir(input_dir)
+    filepaths = []
     
-# =========================
-# Extract the training
-# =========================
-def extract_training(training_shp, output_tiff, crs, pixel_size, buffer_size):
+    for file in files:
+        if os.path.splitext(file)[1].lower() == ".geojson":
+            filepath = os.path.join(input_dir, file)
+            filepaths.append(filepath)
+            
+    filepaths = sorted(filepaths)
+        
+    return filepaths
+    
+def create_training(input_file, output_dir, crs, pixel_size, buffer_size):
+    # Define output tiff name
+    output_tiff = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(input_file))[0]}.tif")
+    
     # Read in the training
-    training = gpd.read_file(training_shp)
+    training = gpd.read_file(input_file)
     training = training.to_crs(crs)
     training_temp = f"{os.path.splitext(output_tiff)[0]}.geojson"
     
     # Buffer the training
     training_buffered = training.buffer(buffer_size, cap_style="flat")
-    
-    # Reproject
     training_buffered.to_file(training_temp, driver="GeoJSON")
     
     # Rasterize the training
     rasterize(training_temp, output_tiff, pixel_size, burn_value=1)
         
+    # Tile the training
+    tile_list = tile_training(output_tiff, output_dir, crs)
+    
     # Cleanup
     os.remove(training_temp)
+    os.remove(output_tiff)
+    
+    return tile_list
     
 
 # =========================
@@ -54,10 +71,12 @@ def main():
     print()
     print("=".center(columns, "="))
     print("CREATING PASTURES TRAINING")
+    print()
     
     # Set up variables
     crs = "EPSG:3857"
     pixel_size = 4.77731426716
+    buffer_size = 10
     output_dir = "/gpfs/glad1/Exch/Antoine/Pastures_training/Output_training"
     
     # Move older folders to "Previous versions" folder
@@ -72,37 +91,28 @@ def main():
     date = datetime.now().strftime("%b%d_%Y").lower()
     current_output_dir = os.path.join(output_dir, f"Training_{date}")
     os.makedirs(current_output_dir, exist_ok=True)
-    # antoine_pastures = "/gpfs/glad1/Exch/Antoine/Pastures_training/linear_features/linear_features_01082026/linear_features_01082026.shp"
-    theo_pastures = "/gpfs/glad1/Theo/Shapefiles/Pastures_training/Pastures.shp"
+    antoine_pastures = load_files("/gpfs/glad1/Exch/Antoine/Pastures_training/linear_features/Antoine_pastures")
+    theo_pastures = load_files("/gpfs/glad1/Theo/Shapefiles/Pastures_training")
     
-    # Extract pastures training
-    # antoine_pasture_tiff = os.path.join(current_output_dir, "Antoine_pasture.tif")
-    theo_pasture_tiff = os.path.join(current_output_dir, "Theo_pasture.tif")
-    # extract_training(antoine_pastures, antoine_pasture_tiff, crs, pixel_size, buffer_size=10)
-    extract_training(theo_pastures, theo_pasture_tiff, crs, pixel_size, buffer_size=10)
+    # Create the training
+    planet_tile_list = []
+    for item in antoine_pastures:
+        tile_list = create_training(item, current_output_dir, crs, pixel_size, buffer_size)
+        planet_tile_list.extend(tile_list)
+        print()
     
-    # Tile the training
-    output_tiled = os.path.join(current_output_dir, "tiled")
-    os.makedirs(output_tiled, exist_ok=True)
-    # antoine_tile_list = tile_training(antoine_pasture_tiff, output_tiled, crs)
-    theo_tile_list = tile_training(theo_pasture_tiff, output_tiled, crs)
+    for item in theo_pastures:
+        tile_list = create_training(item, current_output_dir, crs, pixel_size, buffer_size)
+        planet_tile_list.extend(tile_list)
+        print()
     
     # Write out planet tile list
-    planet_tile_list = []
-    # planet_tile_list.extend(antoine_tile_list)
-    planet_tile_list.extend(theo_tile_list)
     planet_tile_list = sorted(set(planet_tile_list))
-    
     tiles_txt = os.path.join(current_output_dir, "planet_tiles.txt")
-    
     with open(tiles_txt, "w") as f:
         f.write("location\n")
         f.writelines(f"{tile}\n"for tile in planet_tile_list)
         
-    # Cleanup
-    # os.remove(antoine_pasture_tiff)
-    os.remove(theo_pasture_tiff)
-
     print()
     print("=".center(columns, "="))
     print()
