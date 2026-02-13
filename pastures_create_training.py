@@ -1,7 +1,7 @@
 # Theo Kerr on 12/02/2025
 
 # Global imports/env settings
-from osgeo import gdal, ogr
+from osgeo import gdal
 from datetime import datetime
 import geopandas as gpd
 import os, shutil
