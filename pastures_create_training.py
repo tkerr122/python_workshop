@@ -1,7 +1,7 @@
 # Theo Kerr on 12/02/2025
 
 # Global imports/env settings
-from osgeo import gdal
+from osgeo import gdal, ogr
 from datetime import datetime
 import geopandas as gpd
 import os, shutil
@@ -29,7 +29,7 @@ def load_files(input_dir):
     filepaths = []
     
     for file in files:
-        if os.path.splitext(file)[1].lower() == ".geojson":
+        if file.lower().endswith(".geojson"):
             filepath = os.path.join(input_dir, file)
             filepaths.append(filepath)
             

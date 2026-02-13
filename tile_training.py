@@ -44,7 +44,7 @@ def tile_training(raster_path, output_dir, crs="EPSG:3857"):
                                         warpOptions=["COMPRESS=LZW", "BIGTIFF=YES"])
         
         # Warp the raster for current tile
-        dst_ds = os.path.join(output_dir, f"{feature_name}_{tile}_training.tif")
+        dst_ds = os.path.join(output_dir, f"{tile}_training.tif")
         
         gdal.Warp(dst_ds, raster_path, options=warp_options)
         
