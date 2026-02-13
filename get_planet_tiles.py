@@ -61,22 +61,22 @@ def main():
     raster_path = args.raster_path
     txt_path = args.txt_path
 
-    # Loop through the folder and get the planet tiles for each CHM
+    # Loop through the folder and get the planet tiles for each raster
     if os.path.isdir(raster_path):
-        chms = os.listdir(raster_path)
+        rasters = os.listdir(raster_path)
         
         # Create progress bar
         print()
-        progress_bar = tqdm(total=len(chms), desc="Progress", unit="CHM")
+        progress_bar = tqdm(total=len(rasters), desc="Progress", unit="raster")
         
         # Get tiles
         tiles_list = []
-        for chm in chms:
+        for raster in rasters:
             # Set up path
-            chm_path = os.path.join(raster_path, chm)
+            raster_path = os.path.join(raster_path, raster)
             
             # Get planet tiles
-            tiles = get_planet_tiles(chm_path)
+            tiles = get_planet_tiles(raster_path)
             tiles_list.extend(tiles)
             
             progress_bar.update(1)
