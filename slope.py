@@ -6,10 +6,10 @@ import os, shutil, argparse
 gdal.UseExceptions()
 
 """I have written this script to be a command-line utility for creating a single merged slope raster
-from a DEM, or folder of DEMs. 
+from a DTM, or folder of DTMs. 
 ====================================================================================================
--p option: path to DEM, or folder of DEMs.
--od option: path to output folder for the slope raster
+-p option: path to DTM, or folder of DTMs.
+-od option: path to output folder for the slope raster, defaults to "/gpfs/glad1/Theo/Data/Lidar/CHM_cleaning/Slope"
 """
 
 
@@ -33,23 +33,23 @@ def get_raster_info(raster_path):
     
     return ds, xsize, ysize, transform, projection
 
-def create_slope(dem_path, output_dir):
-    """Creates a slope raster from a given DEM.
+def create_slope(dtm_path, output_dir):
+    """Creates a slope raster from a given DTM.
 
     Args:
-        dem_path (str): Path to DEM.
+        dtm_path (str): Path to DTM.
         output_dir (str): Path to output directory.
     
     Returns:
         str: Path to the slope raster
     """
     # Create slope raster
-    name = os.path.splitext(os.path.basename(dem_path))[0]
+    name = os.path.splitext(os.path.basename(dtm_path))[0]
     slope_path = os.path.join(output_dir, f"{name}_slope.tif")
     slope_options = gdal.DEMProcessingOptions(format="GTiff",
                                               computeEdges=True,
                                               slopeFormat="degree")
-    gdal.DEMProcessing(slope_path, dem_path, processing="slope", options=slope_options)
+    gdal.DEMProcessing(slope_path, dtm_path, processing="slope", options=slope_options)
     
     return slope_path
 
@@ -58,6 +58,7 @@ def dilate_slope(slope_path, output_dir):
 
     Args:
         slope_path (str): Path to slope raster to dilate.
+        output_dir(str): Path to output directory.
     """
     # Load slope raster
     ds, xsize, ysize, transform, projection = get_raster_info(slope_path)
@@ -89,9 +90,7 @@ def merge_slope(slope_dir, output_tiff):
 
     Args:
         slope_dir (str): Path to slope folder to merge.
-
-    Returns:
-        str: Path to merged slope raster.
+        output_tiff (str): Path to output raster.
     """
     # Create filenames, build VRT
     slope_rasters = [os.path.join(slope_dir, f) for f in os.listdir(slope_dir)]
@@ -113,39 +112,41 @@ def merge_slope(slope_dir, output_tiff):
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Script for creating slope raster from folder of DTMs")
-    parser.add_argument("-p", "--dem-path", type=str, help="Path to DEM or folder of DEMs", required=True)
-    parser.add_argument("-od", "--output-dir", type=str, help="Path to output slope folder", required=True)
+    parser.add_argument("-p", "--dtm-path", type=str, help="Path to DTM or folder of DTMs", required=True)
+    parser.add_argument("-od", "--output-dir", type=str, help="Path to output slope folder", default="/gpfs/glad1/Theo/Data/Lidar/CHM_cleaning/Slope")
     
     # Parse args
     args = parser.parse_args()
     
-    # Set up variables    
-    dem_path = args.dem_path
+    # Set up variables
+    dtm_path = args.dtm_path
     slope_dir = args.output_dir
+    dtm_basename = os.path.basename(dtm_path)
+    survey = dtm_basename.rsplit("_DTM")[0]
     os.makedirs(slope_dir, exist_ok=True)
     
     # Start message
-    print(f"\nCREATING SLOPE RASTERS FOR {os.path.basename(dem_path)}")
+    print(f"\nCREATING SLOPE RASTERS FOR {os.path.basename(dtm_path)}")
     
-    # Loop through DEM folder and create slope rasters
-    if os.path.isdir(dem_path):
+    # Loop through DTM folder and create slope rasters
+    if os.path.isdir(dtm_path):
         # Create subfolders
-        raw_slope_dir = os.path.join(slope_dir, "raw_slope")
-        dilated_slope_dir = os.path.join(slope_dir, "dilated_slope")
+        raw_slope_dir = os.path.join(slope_dir, f"{survey}_raw_slope")
+        dilated_slope_dir = os.path.join(slope_dir, f"{survey}_dilated_slope")
         os.makedirs(raw_slope_dir, exist_ok=True)
         os.makedirs(dilated_slope_dir, exist_ok=True)
         
-        # Get dems
-        dems = os.listdir(dem_path)
+        # Get dtms
+        dtms = os.listdir(dtm_path)
         
         # Create progress bar
         print()
-        progress_bar = tqdm(total=len(dems), desc="Progress", unit="DEM")
+        progress_bar = tqdm(total=len(dtms), desc="Progress", unit="DTM")
         
         # Create slope rasters
-        for dem in dems:
+        for dtm in dtms:
             # Set up path
-            path = os.path.join(dem_path, dem)
+            path = os.path.join(dtm_path, dtm)
             
             # Create slope
             slope_path = create_slope(path, raw_slope_dir)
@@ -158,14 +159,15 @@ def main():
         progress_bar.close()
     
         # Merge the slope rasters
-        merge_slope(dilated_slope_dir, f"{slope_dir}.tif")
+        merge_slope(dilated_slope_dir, f"{survey}_slope.tif")
         
         # Cleanup
-        shutil.rmtree(slope_dir)
+        shutil.rmtree(raw_slope_dir)
+        shutil.rmtree(dilated_slope_dir)
     
     else:
         # Create slope
-        slope_path = create_slope(dem_path, slope_dir)
+        slope_path = create_slope(dtm_path, slope_dir)
         dilate_slope(slope_path, slope_dir)
     
     print("Done")
