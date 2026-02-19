@@ -120,10 +120,10 @@ def main():
     
     # Set up variables
     dtm_path = args.dtm_path
-    slope_dir = args.output_dir
+    output_dir = args.output_dir
     dtm_basename = os.path.basename(dtm_path)
     survey = dtm_basename.rsplit("_DTM")[0]
-    os.makedirs(slope_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     # Start message
     print(f"\nCREATING SLOPE RASTERS FOR {os.path.basename(dtm_path)}")
@@ -131,8 +131,8 @@ def main():
     # Loop through DTM folder and create slope rasters
     if os.path.isdir(dtm_path):
         # Create subfolders
-        raw_slope_dir = os.path.join(slope_dir, f"{survey}_raw_slope")
-        dilated_slope_dir = os.path.join(slope_dir, f"{survey}_dilated_slope")
+        raw_slope_dir = os.path.join(output_dir, f"{survey}_raw_slope")
+        dilated_slope_dir = os.path.join(output_dir, f"{survey}_dilated_slope")
         os.makedirs(raw_slope_dir, exist_ok=True)
         os.makedirs(dilated_slope_dir, exist_ok=True)
         
@@ -159,7 +159,7 @@ def main():
         progress_bar.close()
     
         # Merge the slope rasters
-        merge_slope(dilated_slope_dir, f"{survey}_slope.tif")
+        merge_slope(dilated_slope_dir, os.path.join(output_dir, f"{survey}_slope.tif"))
         
         # Cleanup
         shutil.rmtree(raw_slope_dir)
@@ -167,8 +167,8 @@ def main():
     
     else:
         # Create slope
-        slope_path = create_slope(dtm_path, slope_dir)
-        dilate_slope(slope_path, slope_dir)
+        slope_path = create_slope(dtm_path, output_dir)
+        dilate_slope(slope_path, output_dir)
     
     print("Done")
     
