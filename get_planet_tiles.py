@@ -12,7 +12,6 @@ intersect with.
 ================================================
 -p option: path to the raster or folder of rasters to be processed
 -t option: path to the output TXT file which will have the planet tiles
-
 """
 
 # =========================

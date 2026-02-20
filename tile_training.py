@@ -7,6 +7,9 @@ from tqdm import tqdm
 import os, shutil, argparse
 gdal.UseExceptions()
 
+# Local imports
+from get_planet_tiles import get_planet_tiles
+
 """This script is a command-line utility to split a given raster or folder of rasters
 into tiles matching the planet tile scheme.
 ================================================
@@ -15,17 +18,12 @@ into tiles matching the planet tile scheme.
 -crs: crs for the output tiled rasters
 """
 
-# Local imports
-from get_planet_tiles import get_planet_tiles
-
-
 # ========================
 # Tile training
 # ========================
 def tile_training(raster_path, output_dir, crs="EPSG:3857"):
     # Set up variables
     tiles_to_keep = []
-    feature_name = f"{os.path.splitext(os.path.basename(raster_path))[0]}"
     
     # Get planet tiles
     planet_tile_list = get_planet_tiles(raster_path)
@@ -44,7 +42,7 @@ def tile_training(raster_path, output_dir, crs="EPSG:3857"):
                                         warpOptions=["COMPRESS=LZW", "BIGTIFF=YES"])
         
         # Warp the raster for current tile
-        dst_ds = os.path.join(output_dir, f"{tile}_training.tif")
+        dst_ds = os.path.join(output_dir, f"{tile}.tif")
         
         gdal.Warp(dst_ds, raster_path, options=warp_options)
         
