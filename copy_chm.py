@@ -27,8 +27,8 @@ def copy_chm(paths: list, input_dir: str, output_dir: str) -> None:
     progress_bar.close()
     
 def main():
-    # Setup
-    print("\nCopying CHMs...")
+    # Start message
+    print("\nCOPYING CHMs...")
     
     # Create argument parser
     parser = argparse.ArgumentParser(description="Script for copying CHMs based on a text file")
@@ -51,6 +51,8 @@ def main():
     # Copy the relevant CHMs to a new folder
     print("Moving CHMs...")
     copy_chm(paths, input_dir, output_dir)
+    
+    print("Done")
     
 if __name__ == "__main__":
     main()

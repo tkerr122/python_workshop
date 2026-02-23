@@ -34,7 +34,7 @@ def merge_footprints(footprint_dir, output_file):
     
 def main():
     # Setup
-    print("\nGetting footprints...")
+    print("\nGETTING FOOTPRINTS...")
     
     # Create argument parser
     parser = argparse.ArgumentParser(description="Script for getting the footprints for a folder of rasters")
@@ -62,11 +62,14 @@ def main():
     progress_bar.close()
     
     # Merge footprints
+    print("Merging footprints...")
     output_file = os.path.join(output_dir, f"{os.path.basename(raster_dir)}_footprints.gpkg")
     merge_footprints(temp, output_file)
     
     # Remove footprints dir
     shutil.rmtree(output_dir)
+    
+    print("Done")
         
 if __name__ == "__main__":
     main()
