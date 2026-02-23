@@ -18,7 +18,7 @@ intersect with.
 # Define custom functions
 # =========================
 def get_planet_tiles(raster_path):
-    # Get raster footprint
+    # Set up variables
     footprint_path = f"{os.path.splitext(raster_path)[0]}_footprint.geojson"
     tiles_path = f"{os.path.splitext(raster_path)[0]}_tiles_split.geojson"
     
