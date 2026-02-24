@@ -15,7 +15,7 @@ into tiles matching the planet tile scheme.
 ================================================
 -p option: path to the raster or folder of rasters to be processed
 -od option: path to the output directory for the tiles
--crs: crs for the output tiled rasters
+-crs: crs for the output tiled rasters. Defaults to EPSG:3857
 """
 
 # ========================
@@ -39,7 +39,10 @@ def tile_training(raster_path, output_dir, crs="EPSG:3857"):
                                         cutlineDSName=planet_tiles,
                                         cutlineWhere=current_tile,
                                         cropToCutline=True,
-                                        warpOptions=["COMPRESS=LZW", "BIGTIFF=YES"])
+                                        multithread=True,
+                                        warpMemoryLimit=2000,
+                                        creationOptions=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES", "NUM_THREADS=100"],
+                                        warpOptions=["NUM_THREADS=100"])
         
         # Warp the raster for current tile
         dst_ds = os.path.join(output_dir, f"{tile}.tif")

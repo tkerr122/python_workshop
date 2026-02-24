@@ -113,7 +113,6 @@ def main():
         f.write("location\n")
         f.writelines(f"{tile}\n"for tile in planet_tile_list)
         
-    print()
     print("=".center(columns, "="))
     print()
     

@@ -6,6 +6,7 @@ import os, shutil, argparse
 based on a provided text file
 ================================================
 -s option: lidar survey to copy CHMs from
+-od option: path to output directory
 -t option: path to the txt file
 """
 
@@ -33,6 +34,7 @@ def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Script for copying CHMs based on a text file")
     parser.add_argument("-s", "--survey", type=str, required=True, help="Lidar survey to copy CHMs from")
+    parser.add_argument("-od", "--output-dir", type=str, required=True, help="Path to output directory")
     parser.add_argument("-t", "--text-file", type=str, required=True, help="Path to text file for copying")
     
     # Parse arguments
@@ -41,7 +43,7 @@ def main():
     # Set up variables
     footprints_txt = args.text_file
     input_dir = f"/gpfs/glad1/Theo/Data/Lidar/CHMs_raw/{args.survey}_CHM"
-    output_dir = f"{input_dir}_v2"
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # Load the footprint paths

@@ -67,7 +67,7 @@ def main():
     merge_footprints(temp, output_file)
     
     # Remove footprints dir
-    shutil.rmtree(output_dir)
+    shutil.rmtree(temp)
     
     print("Done")
         
