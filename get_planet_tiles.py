@@ -4,7 +4,7 @@
 # Imports/env settings 
 from osgeo import gdal, ogr
 from tqdm import tqdm
-import argparse, os
+import argparse, os, time
 gdal.UseExceptions()
 
 """This script is a command-line utility to find which planet tiles a given raster or folder of rasters
@@ -18,30 +18,21 @@ intersect with.
 # Define custom functions
 # =========================
 def get_planet_tiles(raster_path):
-    # Set up variables
-    footprint_path = f"{os.path.splitext(raster_path)[0]}_footprint.geojson"
-    tiles_path = f"{os.path.splitext(raster_path)[0]}_tiles_split.geojson"
-    
     # Get raster footprint
-    gdal.Footprint(footprint_path, raster_path, format="GeoJSON", dstSRS="EPSG:3857")
-    
-    # Intersect the footprint and planet tiles
+    footprint_ds = gdal.Footprint("", raster_path, format="Memory", dstSRS="EPSG:3857")
+    footprint_layer = footprint_ds.GetLayer(0)
+    footprint_feature = footprint_layer.GetNextFeature()
+    footprint_geom = footprint_feature.GetGeometryRef().Clone()
+        
+    # Open planet tiles and filter by footprint
     planet_tiles_path = "/gpfs/glad1/Theo/Data/Planet_and_1_degree/Planet_tiles_and_degree.shp"
-    translate_options = gdal.VectorTranslateOptions(format="GeoJSON", 
-                                                    clipSrc=footprint_path, 
-                                                    selectFields=["location"])
-    gdal.VectorTranslate(tiles_path, planet_tiles_path, options=translate_options)
+    tiles_ds = ogr.Open(planet_tiles_path)
+    tiles_layer = tiles_ds.GetLayer(0)
+    tiles_layer.SetSpatialFilter(footprint_geom)
     
     # Return the tiles
-    tiles_ds = ogr.Open(tiles_path)
-    tiles_layer = tiles_ds.GetLayer(0)
-    tiles = [tile.GetField("location") for tile in tiles_layer]
-    tiles = sorted(set(tiles))
-    
-    # Cleanup
-    os.remove(footprint_path)
-    os.remove(tiles_path)
-    
+    tiles = sorted(set(f.GetField("location") for f in tiles_layer))
+
     return tiles
 
 def main():
@@ -72,10 +63,10 @@ def main():
         tiles_list = []
         for raster in rasters:
             # Set up path
-            raster_path = os.path.join(raster_path, raster)
+            full_path = os.path.join(raster_path, raster)
             
             # Get planet tiles
-            tiles = get_planet_tiles(raster_path)
+            tiles = get_planet_tiles(full_path)
             tiles_list.extend(tiles)
             
             progress_bar.update(1)
