@@ -49,7 +49,13 @@ def create_slope(dtm_path, output_dir):
     slope_options = gdal.DEMProcessingOptions(format="GTiff",
                                               computeEdges=True,
                                               slopeFormat="degree")
-    gdal.DEMProcessing(slope_path, dtm_path, processing="slope", options=slope_options)
+    try: 
+        gdal.DEMProcessing(slope_path, dtm_path, processing="slope", options=slope_options)
+    except RuntimeError:
+        print(f"Corrupted DTM, deleting and skipping {os.path.basename(dtm_path)}")
+        os.remove(dtm_path)
+        
+        return None
     
     return slope_path
 
@@ -150,6 +156,10 @@ def main():
             
             # Create slope
             slope_path = create_slope(path, raw_slope_dir)
+            
+            if slope_path is None:
+                progress_bar.update(1)
+                continue
             
             # Dilate slope
             dilate_slope(slope_path, dilated_slope_dir)
