@@ -3,7 +3,8 @@ from tqdm import tqdm
 import os, shutil, argparse
 
 """This script is a command-line utility to copy DTMs from their parent folder to a new directory
-based on a provided text file
+based on a provided text file of the paths to the CHMs (the script assumes the path is to the 
+corresponding CHM, not DTM.)
 ================================================
 -s option: lidar survey to copy DTMs from
 -od option: path to output directory
