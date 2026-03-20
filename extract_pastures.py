@@ -239,10 +239,10 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
         # Update progress bar
         progress.update(task, description="Writing GeoDataFrame...", total=None)
         
-        # Build GeoDataFrame
+        # Build GeoDataFrame and simplify to remove jagged effect from vectorization
         crs = projection.GetAuthorityCode(None)
         gdf = gpd.GeoDataFrame(geometry=lines, crs=f"EPSG:{crs}")
-        # gdf.geometry = gdf.geometry.simplify(tolerance=transform[1])
+        gdf.geometry = gdf.geometry.simplify(tolerance=transform[1])
         
         if rasterize:
             if output_dir is None:
