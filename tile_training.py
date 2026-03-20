@@ -2,10 +2,12 @@
 
 # Global imports/env settings
 from osgeo import gdal
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
 import numpy as np
-from tqdm import tqdm
-import os, shutil, argparse
+import os, argparse
 gdal.UseExceptions()
+console = Console()
 
 # Local imports
 from get_planet_tiles import get_planet_tiles
@@ -25,52 +27,57 @@ def tile_training(raster_path, output_dir, crs="EPSG:3857"):
     # Set up variables
     tiles_to_keep = []
     
-    # Get planet tiles
-    planet_tile_list = get_planet_tiles(raster_path)
-    planet_tiles = "/gpfs/glad1/Theo/Data/Planet_and_1_degree/Planet_tiles_and_degree.shp"
+# Get planet tiles
+    with Progress(SpinnerColumn(),
+            "[progress.description]{task.description}",
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            transient=True) as progress:
+        task = progress.add_task("Getting planet tiles", total=None)
+        planet_tile_list = get_planet_tiles(raster_path)
+        planet_tiles = "/gpfs/glad1/Theo/Data/Planet_and_1_degree/Planet_tiles_and_degree.shp"
     
-    # Loop through planet tiles
-    progress_bar = tqdm(total=len(planet_tile_list), desc="Splitting progress", unit="tile")
-    for tile in planet_tile_list:
-        # Build warp options
-        current_tile = f'"location" = \'{tile}\''
-        warp_options = gdal.WarpOptions(format="GTiff", 
-                                        dstSRS=crs,
-                                        cutlineDSName=planet_tiles,
-                                        cutlineWhere=current_tile,
-                                        cropToCutline=True,
-                                        multithread=True,
-                                        warpMemoryLimit=2000,
-                                        creationOptions=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES", "NUM_THREADS=100"],
-                                        warpOptions=["NUM_THREADS=100"])
-        
-        # Warp the raster for current tile
-        dst_ds = os.path.join(output_dir, f"{tile}.tif")
-        
-        gdal.Warp(dst_ds, raster_path, options=warp_options)
-        
-        progress_bar.update(1)
-        
-        # Remove blank raster
-        ds = gdal.Open(dst_ds)
-        band = ds.GetRasterBand(1)
-        array = band.ReadAsArray()
-        ds = None
-        band = None
-        
-        blank_condition =  np.isin(array, [0, 255])
-        if np.all(blank_condition):
-            os.remove(dst_ds)
-            continue
-        
-        # Add tile to list
-        tiles_to_keep.append(tile)
-
-    # Sort list and remove duplicates before returning
-    tiles_to_keep = sorted(set(tiles_to_keep))
+        # Loop through planet tiles
+        progress.update(task, description="Splitting progress", total=len(planet_tile_list))
+        for tile in planet_tile_list:
+            # Build warp options
+            current_tile = f'"location" = \'{tile}\''
+            warp_options = gdal.WarpOptions(format="GTiff", 
+                                            dstSRS=crs,
+                                            cutlineDSName=planet_tiles,
+                                            cutlineWhere=current_tile,
+                                            cropToCutline=True,
+                                            multithread=True,
+                                            warpMemoryLimit=2000,
+                                            creationOptions=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES", "NUM_THREADS=100"],
+                                            warpOptions=["NUM_THREADS=100"])
+            
+            # Warp the raster for current tile
+            dst_ds = os.path.join(output_dir, f"{tile}.tif")
+            
+            gdal.Warp(dst_ds, raster_path, options=warp_options)
+            
+            progress.update(task, advance=1)
+            
+            # Remove blank raster
+            ds = gdal.Open(dst_ds)
+            band = ds.GetRasterBand(1)
+            array = band.ReadAsArray()
+            ds = None
+            band = None
+            
+            blank_condition =  np.isin(array, [0, 255])
+            if np.all(blank_condition):
+                os.remove(dst_ds)
+                continue
+            
+            # Add tile to list
+            tiles_to_keep.append(tile)
     
-    # Cleanup
-    progress_bar.close()
+        # Sort list and remove duplicates before returning
+        tiles_to_keep = sorted(set(tiles_to_keep))
+    
+    console.print(f"\u2713 Split raster into {len(tiles_to_keep)}", style="dim green")
     
     return tiles_to_keep
 
@@ -88,14 +95,10 @@ def main():
     training_path = args.training_path
     output_dir = args.output_dir
     crs = f"EPSG:{args.crs}"
-    planet_tile_list = []
     os.makedirs(output_dir, exist_ok=True)
     
     # Start message
-    columns = shutil.get_terminal_size().columns
-    print()
-    print("=".center(columns, "="))
-    print(f"TILING TRAINING FOR {os.path.basename(training_path)}")
+    console.print(f"TILING TRAINING FOR {os.path.basename(training_path)}", style="bold cyan")
     
     # Tile training in folder/file
     if os.path.isdir(training_path):
@@ -103,6 +106,7 @@ def main():
         rasters = os.listdir(training_path)
         
         # Tile each raster
+        planet_tile_list = []
         for raster in rasters:
             # Set up path
             path = os.path.join(training_path, raster)
@@ -125,11 +129,10 @@ def main():
         
         with open(tiles_txt, "w") as f:
             f.write("location\n")
-            f.writelines(f"{tile}\n"for tile in planet_tile_list)
+            f.writelines(f"{tile}\n"for tile in tile_list)
+    
+    # End message
+    console.print(f"\n\u2713 All tiles written to {output_dir}\n", style="bold green")
             
-    print()
-    print("=".center(columns, "="))
-    print()
-
 if __name__ == "__main__":
     main()
