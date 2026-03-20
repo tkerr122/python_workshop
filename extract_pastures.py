@@ -45,7 +45,7 @@ def load_linear_features(linear_features_path: str, threshold: int = 50) -> tupl
     return thresholded_linear_features, transform, projection
 
 # Stage 2: Morphologically clean
-def morphological_clean(linear_features_array: np.ndarray, closing_radius: int = 2, min_area: int = 50) -> np.ndarray:
+def morphological_clean(linear_features_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, closing_radius: int = 2, min_area: int = 50, output_dir: str = None, rasterize: bool = False) -> np.ndarray:
     """
     Uses scipy's ndimage to bridge pixel gaps up to the closing radius value, 
     and remove small areas.
@@ -74,6 +74,26 @@ def morphological_clean(linear_features_array: np.ndarray, closing_radius: int =
         to_keep[0] = False
         cleaned = to_keep[labeled]
         
+        # Write output raster if specified
+        if rasterize:
+            if output_dir is None:
+                raise ValueError("Output directory must be provided if rasterize=True")
+
+            output_tiff = os.path.join(output_dir, "input_cleaned.tif")
+            ysize, xsize = cleaned.shape
+            output = gdal.GetDriverByName("GTiff").Create(
+                output_tiff, xsize, ysize, 1, gdal.GDT_Byte, 
+                options=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"]
+                )
+            output_band = output.GetRasterBand(1)
+            output_band.SetNoDataValue(255)
+            output.SetGeoTransform(transform)
+            output.SetProjection(projection.ExportToWkt())
+            output_band.WriteArray(cleaned)
+            
+            output_band = None
+            output = None
+        
     console.print("\u2713 Removed single pixel gaps and small areas", style="dim green")
     
     return cleaned.astype(np.uint8)
@@ -89,8 +109,10 @@ def skeletonize(cleaned_array: np.ndarray, transform: tuple, projection: osr.Spa
         cleaned_array (np.ndarray): numpy array of linear features.
         transform (tuple): the geotransform tuple of the original raster.
         projection(osr.SpatialReference): the projection of the original raster.
-        output_dir (str, optional): path to output skeleton raster, if desired.
+        output_dir (str, optional): path to output directory, if desired.
         Defaults to None.
+        rasterize (bool, optional): whether or not to write out a skeleton raster.
+        Defaults to False.
 
     Returns:
         np.ndarray: centerline array.
@@ -117,14 +139,26 @@ def skeletonize(cleaned_array: np.ndarray, transform: tuple, projection: osr.Spa
             output_band.WriteArray(skeleton)
             
             output_band = None
-            output = None        
+            output = None
     
     console.print("\u2713 Skeletonized linear features", style="dim green")
     
     return skeleton.astype(np.uint8)
 
 # Stage 4: Vectorize
-def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference) -> gpd.GeoDataFrame:
+def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, output_dir: str = None, rasterize: bool = False) -> gpd.GeoDataFrame:
+    """Visits all nodes created from the skeleton array and vectorizes them.
+
+    Args:
+        skeleton_array (np.ndarray): numpy array of skeletonized features
+        transform (tuple): the geotransform tuple of the original raster
+        projection (osr.SpatialReference): the projection of the original raster
+        output_dir (str): path to the output directory, if desired.
+        Defaults to None.
+
+    Returns:
+        gpd.GeoDataFrame: vectorized lines gdf
+    """
     with Progress(SpinnerColumn(),
                   "[progress.description]{task.description}",
                   TimeElapsedColumn(),
@@ -132,10 +166,10 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
         task = progress.add_task("Vectorizing skeleton...", total=None)
         
         # Build graph from skeleton pixels
-        graph, coordinates = skimage.graph.pixel_graph(skeleton_array, mask=skeleton_array, connectivity=2)
+        graph, coordinates = skimage.graph.pixel_graph(skeleton_array, mask=skeleton_array.astype(bool), connectivity=2)
         
         # Convert pixel coordinates to real world
-        rows, cols = np.unravel(coordinates, skeleton_array.shape)
+        rows, cols = np.unravel_index(coordinates, skeleton_array.shape)
         xs = transform[0] + cols * transform[1]
         ys = transform[3] + rows * transform[5]
         real_world_coords = np.column_stack((xs, ys))
@@ -173,6 +207,34 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
                 lines.append(shapely.LineString(coords))
             
             progress.update(task, advance=1)
+        
+        # Handle isolated loops (e.g. triangles, circles)
+        loop_start_nodes = np.where((degree == 2) & ~np.isin(np.arange(len(degree)), list(visited)))[0]
+        progress.update(task, description="Tracing isolated loops...", total=len(loop_start_nodes), completed=0)
+
+        for start in loop_start_nodes:
+            if start in visited:
+                continue
+            path = [start]
+            visited.add(start)
+            current = start
+            
+            while True:
+                neighbours = graph.indices[graph.indptr[current]:graph.indptr[current + 1]]
+                unvisited = [n for n in neighbours if n not in visited]
+                if not unvisited:
+                    break
+                current = unvisited[0]
+                visited.add(current)
+                path.append(current)
+                
+            # Close the loop by appending the start coordinate at the end
+            if len(path) >= 3:
+                coords = [real_world_coords[i] for i in path]
+                coords.append(coords[0])  # close the ring
+                lines.append(shapely.LinearRing(coords))
+                
+            progress.update(task, advance=1)
 
         # Update progress bar
         progress.update(task, description="Writing GeoDataFrame...", total=None)
@@ -180,6 +242,24 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
         # Build GeoDataFrame
         crs = projection.GetAuthorityCode(None)
         gdf = gpd.GeoDataFrame(geometry=lines, crs=f"EPSG:{crs}")
+        # gdf.geometry = gdf.geometry.simplify(tolerance=transform[1])
+        
+        if rasterize:
+            if output_dir is None:
+                raise ValueError("Output directory must be provided if rasterize=True")
+            # Merge connected LineStrings
+            merged = shapely.line_merge(shapely.union_all(gdf.geometry.values))
+            # Explode MultiLineString back into individual LineStrings
+            if merged.geom_type == "MultiLineString":
+                geometries = list(merged.geoms)
+            else:
+                geometries = [merged]
+
+            merged_gdf = gpd.GeoDataFrame(geometry=geometries, crs=gdf.crs)
+
+            # Export to GeoPackage
+            gpkg_path = os.path.join(output_dir, "vectorized.gpkg")
+            merged_gdf.to_file(gpkg_path, driver="GPKG")
 
     console.print("\u2713 Vectorized skeleton", style="dim green")
 
@@ -217,12 +297,14 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
         )
 
         # Calculate bearing at each dangling endpoint 
-        def endpoint_bearing(line, at_start: bool) -> float:
+        def endpoint_bearing(line, at_start: bool, lookback: int = 5) -> float:
             coords = list(line.coords)
+            # Clamp lookback to available coordinates
+            lookback = min(lookback, len(coords) - 1)
             if at_start:
-                p1, p2 = coords[1], coords[0]
+                p1, p2 = coords[lookback], coords[0]
             else:
-                p1, p2 = coords[-2], coords[-1]
+                p1, p2 = coords[-(lookback + 1)], coords[-1]
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             return np.degrees(np.arctan2(dx, dy)) % 360
@@ -267,12 +349,14 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
                 if row["line_idx"] == candidate["line_idx"]:
                     continue
 
-                # Check bearing similarity
+                # Check bearing similarity 
                 angle_diff = abs(row["bearing"] - candidate["bearing"]) % 360
                 angle_diff = min(angle_diff, 360 - angle_diff)
-                if angle_diff > angle_tolerance:
+                is_similar = angle_diff <= angle_tolerance
+                is_opposite = abs(angle_diff - 180) <= angle_tolerance
+                if not (is_similar or is_opposite):
                     continue
-
+                
                 # Synthesize bridging line
                 bridging_lines.append(shapely.LineString([row.geometry, candidate.geometry]))
 
@@ -344,10 +428,10 @@ def main():
     parser = argparse.ArgumentParser(description="Script to find areas enclosed by linear features")
     parser.add_argument("-p", "--linear-features-path", type=str, help="Path to linear features input raster", required=True)
     parser.add_argument("-od", "--output-dir", type=str, help="Output directory", required=True)
+    parser.add_argument("-r", "--raster", action="store_true", help="Whether or not to write out rasters for each step")
     parser.add_argument("-t", "--probability-threshold", type=int, default=50, help="Probability threshold of line features")
     parser.add_argument("-cr", "--closing-radius", type=int, default=2, help="Pixels to consider for initial gap bridging")
     parser.add_argument("-ma", "--min-area", type=int, default=50, help="Component size (in pixels) to retain")
-    parser.add_argument("-sk", "--sk-raster", action="store_true", help="Whether or not to write out the skeleton raster")
     parser.add_argument("-gt", "--gap-tolerance", type=float, default=10.0, help="Gap tolerance for closing gaps")
     parser.add_argument("-at", "--angle-tolerance", type=float, default=30.0, help="Angle tolerance for closing gaps")
     parser.add_argument("-max", "--max-area", type=float, default=None, help="Maximum area for extracted plots")
@@ -356,10 +440,10 @@ def main():
     args = parser.parse_args()
     linear_features_path = args.linear_features_path
     output_dir = args.output_dir
+    raster = args.raster
     probability_threshold = args.probability_threshold
     closing_radius = args.closing_radius
     min_area = args.min_area
-    sk_raster = args.sk_raster
     gap_tolerance = args.gap_tolerance
     angle_tolerance = args.angle_tolerance
     max_area = args.max_area
@@ -373,13 +457,13 @@ def main():
     thresholded_linear_features, transform, projection = load_linear_features(linear_features_path, probability_threshold)
     
     # Stage 2: Morphological cleaning
-    cleaned_array = morphological_clean(thresholded_linear_features, closing_radius, min_area)
+    cleaned_array = morphological_clean(thresholded_linear_features, transform, projection, closing_radius, min_area, output_dir, rasterize=raster)
     
     # Stage 3: Skeletonize
-    skeleton_array = skeletonize(cleaned_array, transform, projection, output_dir, rasterize=sk_raster)
+    skeleton_array = skeletonize(cleaned_array, transform, projection, output_dir, rasterize=raster)
     
     # Stage 4: Vectorize
-    vectorized_gdf = vectorize(skeleton_array, transform, projection)
+    vectorized_gdf = vectorize(skeleton_array, transform, projection, output_dir, rasterize=raster)
     
     # Stage 5: Close gaps
     closed_gaps = close_gaps(vectorized_gdf, gap_tolerance, angle_tolerance)
