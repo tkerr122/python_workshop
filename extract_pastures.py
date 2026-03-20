@@ -45,7 +45,7 @@ def load_linear_features(linear_features_path: str, threshold: int = 50) -> tupl
     return thresholded_linear_features, transform, projection
 
 # Stage 2: Morphologically clean
-def morphological_clean(linear_features_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, closing_radius: int = 2, min_area: int = 50, output_dir: str = None, rasterize: bool = False) -> np.ndarray:
+def morphological_clean(linear_features_array: np.ndarray, closing_radius: int = 2, min_area: int = 50) -> np.ndarray:
     """
     Uses scipy's ndimage to bridge pixel gaps up to the closing radius value, 
     and remove small areas.
@@ -73,27 +73,7 @@ def morphological_clean(linear_features_array: np.ndarray, transform: tuple, pro
         to_keep = component_sizes >= min_area
         to_keep[0] = False
         cleaned = to_keep[labeled]
-        
-        # Write output raster if specified
-        if rasterize:
-            if output_dir is None:
-                raise ValueError("Output directory must be provided if rasterize=True")
-
-            output_tiff = os.path.join(output_dir, "input_cleaned.tif")
-            ysize, xsize = cleaned.shape
-            output = gdal.GetDriverByName("GTiff").Create(
-                output_tiff, xsize, ysize, 1, gdal.GDT_Byte, 
-                options=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"]
-                )
-            output_band = output.GetRasterBand(1)
-            output_band.SetNoDataValue(255)
-            output.SetGeoTransform(transform)
-            output.SetProjection(projection.ExportToWkt())
-            output_band.WriteArray(cleaned)
-            
-            output_band = None
-            output = None
-        
+                
     console.print("\u2713 Removed single pixel gaps and small areas", style="dim green")
     
     return cleaned.astype(np.uint8)
@@ -146,7 +126,7 @@ def skeletonize(cleaned_array: np.ndarray, transform: tuple, projection: osr.Spa
     return skeleton.astype(np.uint8)
 
 # Stage 4: Vectorize
-def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, output_dir: str = None, rasterize: bool = False) -> gpd.GeoDataFrame:
+def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference) -> gpd.GeoDataFrame:
     """Visits all nodes created from the skeleton array and vectorizes them.
 
     Args:
@@ -159,107 +139,36 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
     Returns:
         gpd.GeoDataFrame: vectorized lines gdf
     """
+    # Get all skeleton pixel coordinates
+    rows, cols = np.where(skeleton_array)
+    skeleton_set = set(zip(rows.tolist(), cols.tolist()))
+
     with Progress(SpinnerColumn(),
                   "[progress.description]{task.description}",
+                  MofNCompleteColumn(),
                   TimeElapsedColumn(),
                   transient=True) as progress:
-        task = progress.add_task("Vectorizing skeleton...", total=None)
-        
-        # Build graph from skeleton pixels
-        graph, coordinates = skimage.graph.pixel_graph(skeleton_array, mask=skeleton_array.astype(bool), connectivity=2)
-        
-        # Convert pixel coordinates to real world
-        rows, cols = np.unravel_index(coordinates, skeleton_array.shape)
-        xs = transform[0] + cols * transform[1]
-        ys = transform[3] + rows * transform[5]
-        real_world_coords = np.column_stack((xs, ys))
-        
-        # Assemble the LineStrings by traversing graph
+        task = progress.add_task("Vectorizing skeleton...", total=len(skeleton_set))
         lines = []
-        visited = set()
-        
-        # Find all dangling endpoints as starting points
-        degree = np.diff(graph.indptr)
-        start_nodes = np.where(degree == 1)[0]
-        
-        # Update progress bar
-        progress.update(task, total=len(start_nodes))
 
-        for start in start_nodes:
-            if start in visited:
-                continue
-            path = [start]
-            visited.add(start)
-            current = start
-
-            while True:
-                # Get unvisited neighbours
-                neighbours = graph.indices[graph.indptr[current]:graph.indptr[current + 1]]
-                unvisited = [n for n in neighbours if n not in visited]
-                if not unvisited:
-                    break
-                current = unvisited[0]
-                visited.add(current)
-                path.append(current)
-
-            if len(path) >= 2:
-                coords = [real_world_coords[i] for i in path]
-                lines.append(shapely.LineString(coords))
-            
-            progress.update(task, advance=1)
-        
-        # Handle isolated loops (e.g. triangles, circles)
-        loop_start_nodes = np.where((degree == 2) & ~np.isin(np.arange(len(degree)), list(visited)))[0]
-        progress.update(task, description="Tracing isolated loops...", total=len(loop_start_nodes), completed=0)
-
-        for start in loop_start_nodes:
-            if start in visited:
-                continue
-            path = [start]
-            visited.add(start)
-            current = start
-            
-            while True:
-                neighbours = graph.indices[graph.indptr[current]:graph.indptr[current + 1]]
-                unvisited = [n for n in neighbours if n not in visited]
-                if not unvisited:
-                    break
-                current = unvisited[0]
-                visited.add(current)
-                path.append(current)
-                
-            # Close the loop by appending the start coordinate at the end
-            if len(path) >= 3:
-                coords = [real_world_coords[i] for i in path]
-                coords.append(coords[0])  # close the ring
-                lines.append(shapely.LinearRing(coords))
-                
+        for r, c in skeleton_set:
+            for dr, dc in [
+                (0, 1),   # E
+                (1, 0),   # S
+                (1, 1),   # SE
+                (1, -1),  # SW
+            ]:
+                nr, nc = r + dr, c + dc
+                if (nr, nc) in skeleton_set:
+                    x1 = transform[0] + c * transform[1]
+                    y1 = transform[3] + r * transform[5]
+                    x2 = transform[0] + nc * transform[1]
+                    y2 = transform[3] + nr * transform[5]
+                    lines.append(shapely.LineString([(x1, y1), (x2, y2)]))
             progress.update(task, advance=1)
 
-        # Update progress bar
-        progress.update(task, description="Writing GeoDataFrame...", total=None)
-        
-        # Build GeoDataFrame and simplify to remove jagged effect from vectorization
         crs = projection.GetAuthorityCode(None)
         gdf = gpd.GeoDataFrame(geometry=lines, crs=f"EPSG:{crs}")
-        gdf.geometry = gdf.geometry.simplify(tolerance=transform[1])
-        
-        if rasterize:
-            if output_dir is None:
-                raise ValueError("Output directory must be provided if rasterize=True")
-            # Merge connected LineStrings
-            merged = shapely.line_merge(shapely.union_all(gdf.geometry.values))
-            # Explode MultiLineString back into individual LineStrings
-            if merged.geom_type == "MultiLineString":
-                geometries = list(merged.geoms)
-            else:
-                geometries = [merged]
-
-            merged_gdf = gpd.GeoDataFrame(geometry=geometries, crs=gdf.crs)
-
-            # Export to GeoPackage
-            gpkg_path = os.path.join(output_dir, "vectorized.gpkg")
-            merged_gdf.to_file(gpkg_path, driver="GPKG")
 
     console.print("\u2713 Vectorized skeleton", style="dim green")
 
@@ -375,16 +284,15 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
     return gdf
 
 # Stage 6: Merge and export
-def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str) -> gpd.GeoDataFrame:
+def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -> gpd.GeoDataFrame:
     with console.status("Merging and exporting...", spinner="dots"):
         # Merge connected LineStrings
         merged = shapely.line_merge(shapely.union_all(gdf.geometry.values))
-        # Explode MultiLineString back into individual LineStrings
+        merged = merged.simplify(tolerance=transform[1])
         if merged.geom_type == "MultiLineString":
             geometries = list(merged.geoms)
         else:
             geometries = [merged]
-
         merged_gdf = gpd.GeoDataFrame(geometry=geometries, crs=gdf.crs)
 
         # Export to GeoPackage
@@ -428,7 +336,7 @@ def main():
     parser = argparse.ArgumentParser(description="Script to find areas enclosed by linear features")
     parser.add_argument("-p", "--linear-features-path", type=str, help="Path to linear features input raster", required=True)
     parser.add_argument("-od", "--output-dir", type=str, help="Output directory", required=True)
-    parser.add_argument("-r", "--raster", action="store_true", help="Whether or not to write out rasters for each step")
+    parser.add_argument("-sk", "--sk-raster", action="store_true", help="Whether or not to write out skeleton raster")
     parser.add_argument("-t", "--probability-threshold", type=int, default=50, help="Probability threshold of line features")
     parser.add_argument("-cr", "--closing-radius", type=int, default=2, help="Pixels to consider for initial gap bridging")
     parser.add_argument("-ma", "--min-area", type=int, default=50, help="Component size (in pixels) to retain")
@@ -440,7 +348,7 @@ def main():
     args = parser.parse_args()
     linear_features_path = args.linear_features_path
     output_dir = args.output_dir
-    raster = args.raster
+    sk_raster = args.sk_raster
     probability_threshold = args.probability_threshold
     closing_radius = args.closing_radius
     min_area = args.min_area
@@ -457,19 +365,19 @@ def main():
     thresholded_linear_features, transform, projection = load_linear_features(linear_features_path, probability_threshold)
     
     # Stage 2: Morphological cleaning
-    cleaned_array = morphological_clean(thresholded_linear_features, transform, projection, closing_radius, min_area, output_dir, rasterize=raster)
+    cleaned_array = morphological_clean(thresholded_linear_features, closing_radius, min_area)
     
     # Stage 3: Skeletonize
-    skeleton_array = skeletonize(cleaned_array, transform, projection, output_dir, rasterize=raster)
+    skeleton_array = skeletonize(cleaned_array, transform, projection, output_dir, rasterize=sk_raster)
     
     # Stage 4: Vectorize
-    vectorized_gdf = vectorize(skeleton_array, transform, projection, output_dir, rasterize=raster)
+    vectorized_gdf = vectorize(skeleton_array, transform, projection)
     
     # Stage 5: Close gaps
     closed_gaps = close_gaps(vectorized_gdf, gap_tolerance, angle_tolerance)
     
     # Stage 6: Merge and export
-    merged_gdf = merge_and_export(closed_gaps, output_dir)
+    merged_gdf = merge_and_export(closed_gaps, output_dir, transform)
     
     # Stage 7: Polygonize
     polygonize(merged_gdf, output_dir, max_area)
