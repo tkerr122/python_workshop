@@ -8,8 +8,6 @@ import pandas as pd
 import numpy as np
 import shapely, skimage, os, argparse
 gdal.UseExceptions()
-console = Console()
-
 """
 I have written this script to be a command-line utility for extracting areas
 enclosed by linear features.
@@ -17,16 +15,16 @@ enclosed by linear features.
 -p option: path to linear features input raster
 -od option: output directory
 -sk option: whether or not to write out skeleton raster
--t option: probability threshold of line features
+-t option: probability threshold of line features. Defaults to 50.
 -cr option: pixels to consider for initial gap bridging
 -ma option: minimum component size (in pixels) to retain
--gt option: gap tolerance for closing gaps
+-gt option: gap tolerance for closing gaps (in meters)
 -at option: angle tolerance for closing gaps
 -max option: maximum area for extracted plots
 """
 
 # Stage 1: Load the linear features
-def load_linear_features(linear_features_path: str, threshold: int = 50) -> tuple:
+def load_linear_features(console, linear_features_path: str, threshold: int = 50) -> tuple:
     """
     Loads in a raster of linear features with pixel values from 0-100
     probability. Keeps pixels above the threshold and returns a numpy 
@@ -60,7 +58,7 @@ def load_linear_features(linear_features_path: str, threshold: int = 50) -> tupl
     return thresholded_linear_features, transform, projection
 
 # Stage 2: Morphologically clean
-def morphological_clean(linear_features_array: np.ndarray, closing_radius: int = 2, min_area: int = 50) -> np.ndarray:
+def morphological_clean(console, linear_features_array: np.ndarray, closing_radius: int = 2, min_area: int = 50) -> np.ndarray:
     """
     Uses scipy's ndimage to bridge pixel gaps up to the closing radius value, 
     and remove small areas.
@@ -94,7 +92,7 @@ def morphological_clean(linear_features_array: np.ndarray, closing_radius: int =
     return cleaned.astype(np.uint8)
 
 # Stage 3: Skeletonize
-def skeletonize(cleaned_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, output_dir: str = None, rasterize: bool = False) -> np.ndarray:
+def skeletonize(console, cleaned_array: np.ndarray, transform: tuple, projection: osr.SpatialReference, output_dir: str = None, rasterize: bool = False) -> np.ndarray:
     """
     Uses sklearn's skeletonize function on the linear features array and 
     returns the single-pixel-wide centerlines. Also writes them to a 
@@ -141,7 +139,7 @@ def skeletonize(cleaned_array: np.ndarray, transform: tuple, projection: osr.Spa
     return skeleton.astype(np.uint8)
 
 # Stage 4: Vectorize
-def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference) -> gpd.GeoDataFrame:
+def vectorize(console, skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference) -> gpd.GeoDataFrame:
     """Visits all nodes created from the skeleton array and vectorizes them.
 
     Args:
@@ -190,7 +188,7 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
     return gdf
 
 # Stage 5: Close gaps 
-def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_tolerance: float = 30.0) -> gpd.GeoDataFrame:
+def close_gaps(console, gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_tolerance: float = 30.0) -> gpd.GeoDataFrame:
     """Find all dangling endpoints of the lines and search within the
     distance of "gap_tolerance" to close them. Also uses angle tolerance
     to only close gaps between lines that are plausibly connected (no
@@ -316,7 +314,7 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
     return gdf
 
 # Stage 6: Merge and export
-def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -> gpd.GeoDataFrame:
+def merge_and_export(console, gdf: gpd.GeoDataFrame, input_file: str, output_dir: str, transform: tuple) -> gpd.GeoDataFrame:
     """Takes the input gdf and merges the geometries into 1 geometry, also 
     simplifying to remove "staircase" effect from vectorizing.
     Finally, exports the gdf to a GeoPackage in the output directory.
@@ -340,7 +338,7 @@ def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -
         merged_gdf = gpd.GeoDataFrame(geometry=geometries, crs=gdf.crs)
 
         # Export to GeoPackage
-        gpkg_path = os.path.join(output_dir, "linear_features.gpkg")
+        gpkg_path = os.path.join(output_dir, f"{input_file}_linear_features.gpkg")
         merged_gdf.to_file(gpkg_path, driver="GPKG")
 
     console.print("\u2713 Merged and exported", style="dim green")
@@ -348,7 +346,7 @@ def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -
     return merged_gdf
 
 # Step 7: Polygonize
-def polygonize(gdf: gpd.GeoDataFrame, output_dir: str, max_area: float = None) -> None:
+def polygonize(console, gdf: gpd.GeoDataFrame, input_file: str, output_dir: str, max_area: float = None) -> None:
     """Extracts polygons enclosed by the lines gdf up to the "max_area" (if 
     specified) and writes them to a GeoPackage in the output directory.
 
@@ -378,11 +376,41 @@ def polygonize(gdf: gpd.GeoDataFrame, output_dir: str, max_area: float = None) -
             polygon_gdf = polygon_gdf[polygon_gdf["area_m2"] <= max_area].reset_index(drop=True)
 
         # Export to GeoPackage
-        gpkg_path = os.path.join(output_dir, "plots.gpkg")
+        gpkg_path = os.path.join(output_dir, f"{input_file}_plots.gpkg")
         polygon_gdf.to_file(gpkg_path, driver="GPKG")
 
     console.print(f"\u2713 Found {len(polygon_gdf)} enclosed polygons", style="dim green")
-
+    
+# Extract polygons
+def extract_polygons(linear_features_path, input_file, output_dir, verbose=False, probability_threshold=50, closing_radius=2, min_area=50, sk_raster=False, gap_tolerance=10.0, angle_tolerance=30.0, max_area=None):
+    # Setup
+    console = Console(quiet=not verbose)
+    console.print(f"\nEXTRACTING POLYGONS FROM {os.path.basename(linear_features_path)}", style="bold cyan")
+   
+    # Stage 1: Load linear features
+    thresholded_linear_features, transform, projection = load_linear_features(console, linear_features_path, probability_threshold)
+    
+    # Stage 2: Morphological cleaning
+    cleaned_array = morphological_clean(console, thresholded_linear_features, closing_radius, min_area)
+    
+    # Stage 3: Skeletonize
+    skeleton_array = skeletonize(console, cleaned_array, transform, projection, output_dir, rasterize=sk_raster)
+    
+    # Stage 4: Vectorize
+    vectorized_gdf = vectorize(console, skeleton_array, transform, projection)
+    
+    # Stage 5: Close gaps
+    closed_gaps = close_gaps(console, vectorized_gdf, gap_tolerance, angle_tolerance)
+    
+    # Stage 6: Merge and export
+    merged_gdf = merge_and_export(console, closed_gaps, input_file, output_dir, transform)
+    
+    # Stage 7: Polygonize
+    polygonize(console, merged_gdf, input_file, output_dir, max_area)
+    
+    # End message
+    console.print(f"\nExtracted polygons written to {output_dir}\n", style="bold green")
+    
 # Main function
 def main():
     # Create argument parser
@@ -409,34 +437,12 @@ def main():
     angle_tolerance = args.angle_tolerance
     max_area = args.max_area
     
+    verbose = True
+    input_file = os.path.splitext(os.path.basename(linear_features_path))[0]
     os.makedirs(output_dir, exist_ok=True)
 
-    # Start message
-    console.print(f"\nEXTRACTING PASTURES FROM {os.path.basename(linear_features_path)}", style="bold cyan")
-    
-    # Stage 1: Load linear features
-    thresholded_linear_features, transform, projection = load_linear_features(linear_features_path, probability_threshold)
-    
-    # Stage 2: Morphological cleaning
-    cleaned_array = morphological_clean(thresholded_linear_features, closing_radius, min_area)
-    
-    # Stage 3: Skeletonize
-    skeleton_array = skeletonize(cleaned_array, transform, projection, output_dir, rasterize=sk_raster)
-    
-    # Stage 4: Vectorize
-    vectorized_gdf = vectorize(skeleton_array, transform, projection)
-    
-    # Stage 5: Close gaps
-    closed_gaps = close_gaps(vectorized_gdf, gap_tolerance, angle_tolerance)
-    
-    # Stage 6: Merge and export
-    merged_gdf = merge_and_export(closed_gaps, output_dir, transform)
-    
-    # Stage 7: Polygonize
-    polygonize(merged_gdf, output_dir, max_area)
-    
-    # End message
-    console.print(f"\nExtracted pastures written to {output_dir}\n", style="bold green")
+    # Extract polygons
+    extract_polygons(linear_features_path, input_file, output_dir, verbose, probability_threshold, closing_radius, min_area, sk_raster, gap_tolerance, angle_tolerance, max_area)
 
 if __name__ == "__main__":
     main()
