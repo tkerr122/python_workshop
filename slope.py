@@ -1,3 +1,5 @@
+# Theo Kerr
+
 # Imports/env settings 
 from osgeo import gdal
 from tqdm import tqdm
@@ -5,17 +7,16 @@ from scipy.ndimage import grey_dilation
 import os, shutil, argparse
 gdal.UseExceptions()
 
-"""I have written this script to be a command-line utility for creating a single merged slope raster
-from a DTM, or folder of DTMs. 
-====================================================================================================
+"""
+I have written this script to be a command-line utility for creating a single 
+merged slope raster from a DTM, or folder of DTMs. 
+===============================================================================
 -p option: path to DTM, or folder of DTMs.
--od option: path to output folder for the slope raster, defaults to "/gpfs/glad1/Theo/Data/Lidar/CHM_cleaning/Slope"
+-od option: path to output folder for the slope raster. 
+Defaults to "/gpfs/glad1/Theo/Data/Lidar/CHM_cleaning/Slope"
 """
 
-
-# =========================
-# Define custom functions
-# =========================
+# Get raster info
 def get_raster_info(raster_path):
     """Opens a raster at the given path.
 
@@ -33,6 +34,7 @@ def get_raster_info(raster_path):
     
     return ds, xsize, ysize, transform, projection
 
+# Create slope
 def create_slope(dtm_path, output_dir):
     """Creates a slope raster from a given DTM.
 
@@ -59,6 +61,7 @@ def create_slope(dtm_path, output_dir):
     
     return slope_path
 
+# Dilate slope
 def dilate_slope(slope_path, output_dir):
     """Uses the SciPy Grey Dilation tool to emphasize high slope values in the given slope raster
 
@@ -91,6 +94,7 @@ def dilate_slope(slope_path, output_dir):
     output_band = None
     output = None
     
+# Merge slope
 def merge_slope(slope_dir, output_tiff):
     """Uses GDAL BuildVRT and GDAL Translate tools to merge all slope rasters in a given folder.
 
@@ -111,10 +115,6 @@ def merge_slope(slope_dir, output_tiff):
     # Cleanup
     os.remove(vrt_path)
     
-
-# =========================
-# Create slope
-# =========================
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Script for creating slope raster from folder of DTMs")

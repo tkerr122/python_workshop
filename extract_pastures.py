@@ -10,6 +10,21 @@ import shapely, skimage, os, argparse
 gdal.UseExceptions()
 console = Console()
 
+"""
+I have written this script to be a command-line utility for extracting areas
+enclosed by linear features.
+===============================================================================
+-p option: path to linear features input raster
+-od option: output directory
+-sk option: whether or not to write out skeleton raster
+-t option: probability threshold of line features
+-cr option: pixels to consider for initial gap bridging
+-ma option: minimum component size (in pixels) to retain
+-gt option: gap tolerance for closing gaps
+-at option: angle tolerance for closing gaps
+-max option: maximum area for extracted plots
+"""
+
 # Stage 1: Load the linear features
 def load_linear_features(linear_features_path: str, threshold: int = 50) -> tuple:
     """
@@ -176,6 +191,21 @@ def vectorize(skeleton_array: np.ndarray, transform: tuple, projection: osr.Spat
 
 # Stage 5: Close gaps 
 def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_tolerance: float = 30.0) -> gpd.GeoDataFrame:
+    """Find all dangling endpoints of the lines and search within the
+    distance of "gap_tolerance" to close them. Also uses angle tolerance
+    to only close gaps between lines that are plausibly connected (no
+    sharp angle connections.)
+
+    Args:
+        gdf (gpd.GeoDataFrame): lines gdf returned by vectorize function.
+        gap_tolerance (float, optional): distance between lines segments 
+        to close. Defaults to 10.0.
+        angle_tolerance (float, optional): angle threshold beyond which 
+        gap will not be closed. Defaults to 30.0.
+
+    Returns:
+        gpd.GeoDataFrame: lines gdf with gaps closed.
+    """
     with Progress(SpinnerColumn(),
                   "[progress.description]{task.description}",
                   MofNCompleteColumn(),
@@ -204,8 +234,10 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
             geometry=dangling_geoms,
             crs=gdf.crs
         )
-
+        
         # Calculate bearing at each dangling endpoint 
+        progress.update(task, description="Finding bearings...", total=len(dangling))
+
         def endpoint_bearing(line, at_start: bool, lookback: int = 5) -> float:
             coords = list(line.coords)
             # Clamp lookback to available coordinates
@@ -218,9 +250,6 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
             dy = p2[1] - p1[1]
             return np.degrees(np.arctan2(dx, dy)) % 360
         
-        # Update progress bar
-        progress.update(task, description="Finding bearings...", total=len(dangling))
-
         bearings = []
         for pt in dangling:
             line_idx = endpoint_to_line[pt]
@@ -229,7 +258,8 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
             bearings.append(endpoint_bearing(line, at_start))
             
             progress.update(task, advance=1)
-
+        
+        # Add bearings to the gdf
         dangling_gdf["bearing"] = bearings
 
         # Find candidate pairs and bridge valid gaps 
@@ -237,7 +267,7 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
         visited_pairs = set()
         bridging_lines = []
         
-        # Update progress bar
+        # Close gaps
         progress.update(task, description="Closing gaps...", total=len(dangling_gdf), completed=0)
 
         for i, row in dangling_gdf.iterrows():
@@ -246,8 +276,10 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
             candidates = dangling_gdf.iloc[sindex.query(buffer)]
 
             for j, candidate in candidates.iterrows():
+                # Skip identical points
                 if i == j:
                     continue
+                
                 # Avoid processing the same pair twice
                 pair = tuple(sorted((i, j)))
                 if pair in visited_pairs:
@@ -258,7 +290,7 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
                 if row["line_idx"] == candidate["line_idx"]:
                     continue
 
-                # Check bearing similarity 
+                # Check bearing similarity
                 angle_diff = abs(row["bearing"] - candidate["bearing"]) % 360
                 angle_diff = min(angle_diff, 360 - angle_diff)
                 is_similar = angle_diff <= angle_tolerance
@@ -285,6 +317,18 @@ def close_gaps(gdf: gpd.GeoDataFrame, gap_tolerance: float = 10.0, angle_toleran
 
 # Stage 6: Merge and export
 def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -> gpd.GeoDataFrame:
+    """Takes the input gdf and merges the geometries into 1 geometry, also 
+    simplifying to remove "staircase" effect from vectorizing.
+    Finally, exports the gdf to a GeoPackage in the output directory.
+
+    Args:
+        gdf (gpd.GeoDataFrame): gdf of lines with gaps closed.
+        output_dir (str): path to the output directory.
+        transform (tuple): the geotransform of the original raster.
+
+    Returns:
+        gpd.GeoDataFrame: simplified lines gdf.
+    """
     with console.status("Merging and exporting...", spinner="dots"):
         # Merge connected LineStrings
         merged = shapely.line_merge(shapely.union_all(gdf.geometry.values))
@@ -305,19 +349,28 @@ def merge_and_export(gdf: gpd.GeoDataFrame, output_dir: str, transform: tuple) -
 
 # Step 7: Polygonize
 def polygonize(gdf: gpd.GeoDataFrame, output_dir: str, max_area: float = None) -> None:
+    """Extracts polygons enclosed by the lines gdf up to the "max_area" (if 
+    specified) and writes them to a GeoPackage in the output directory.
+
+    Args:
+        gdf (gpd.GeoDataFrame): merged lines gdf.
+        output_dir (str): path to the output directory
+        max_area (float, optional): maximum area for the polygons.
+        Defaults to None.
+    """
     with console.status("Polygonizing linear features...", spinner="dots"):
         # Node the lines at all intersections before polygonizing
         noded = shapely.union_all(gdf.geometry.values)
+        
         # Extract enclosed polygons
         polygons = list(shapely.ops.polygonize(noded))
-
         if not polygons:
             console.print("No enclosed polygons found", style="dim yellow")
             return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
 
         polygon_gdf = gpd.GeoDataFrame(geometry=polygons, crs=gdf.crs)
 
-        # Calculate area in square meters (valid since we are in EPSG:3857)
+        # Calculate area in square meters
         polygon_gdf["area_m2"] = polygon_gdf.geometry.area
 
         # Filter out artifact polygons above max area if specified

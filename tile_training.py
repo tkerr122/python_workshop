@@ -12,22 +12,21 @@ console = Console()
 # Local imports
 from get_planet_tiles import get_planet_tiles
 
-"""This script is a command-line utility to split a given raster or folder of rasters
-into tiles matching the planet tile scheme.
-================================================
+"""
+This script is a command-line utility to split a given raster or folder of
+rasters into tiles matching the planet tile scheme.
+===============================================================================
 -p option: path to the raster or folder of rasters to be processed
 -od option: path to the output directory for the tiles
 -crs: crs for the output tiled rasters. Defaults to EPSG:3857
 """
 
-# ========================
 # Tile training
-# ========================
 def tile_training(raster_path, output_dir, crs="EPSG:3857"):
     # Set up variables
     tiles_to_keep = []
     
-# Get planet tiles
+    # Get planet tiles
     with Progress(SpinnerColumn(),
             "[progress.description]{task.description}",
             MofNCompleteColumn(),
