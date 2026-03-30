@@ -4,7 +4,7 @@
 # Imports/env settings 
 from osgeo import gdal, ogr
 from tqdm import tqdm
-import argparse, os, time
+import argparse, os
 gdal.UseExceptions()
 
 """This script is a command-line utility to find which planet tiles a given raster or folder of rasters
