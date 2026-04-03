@@ -3,21 +3,50 @@
 # Imports/env settings
 from shapely.geometry import box
 from scipy import stats
-import numpy as np
-import geopandas as gpd
 from osgeo import gdal, ogr
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from rich.logging import RichHandler
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
-import os, time
+import numpy as np
+import geopandas as gpd
+import os, logging
 console = Console()
 gdal.UseExceptions()
 
+# =============================================================================
+# GLOBALS
+# =============================================================================
+GFC_TILES = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles"
+TRAINING_SHP = "/gpfs/glad1/Theo/Shapefiles/GFC/gfc_training.shp"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_3_2026"
+N_WORKERS = 180
+
+# -----------------------------------------------------------------------------
+# Logging setup using Rich
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",  # richer format for the file
+    handlers=[
+        RichHandler(
+            console=console,
+            rich_tracebacks=True,
+            show_path=False,
+            log_time_format="[%H:%M:%S]"
+        ),
+        logging.FileHandler(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfc_extractor.log"),
+            mode="w"
+        )
+    ]
+)
+log = logging.getLogger(__name__)
 
 # =============================================================================
 # Utility functions
 # =============================================================================
-
 def get_raster_info(raster_path):
     ds = gdal.Open(raster_path, gdal.GA_ReadOnly)
     cols = ds.RasterXSize
@@ -47,33 +76,76 @@ def compute_mode_nonzero(pixels):
     return int(mode_result.mode)
 
 def classify_change(year_start, year_end):
-    # Case 1: change is natural, need to extract mode year of change
-    if np.isnan(year_start) and np.isnan(year_end):
-        return "null_both"
+    # Setup: treat pandas NA, None, and float NaN uniformly
+    start_null = (year_start is None) or (
+        isinstance(year_start, float) and np.isnan(year_start)
+    )
+    end_null = (year_end is None) or (
+        isinstance(year_end, float) and np.isnan(year_end)
+    )
     
+    # Case 1: change is natural, need to extract mode year of change
+    if start_null and end_null:
+        return "null_both"
+
     # Case 2: change is manmade, need to extract all change
-    elif year_start == 100 and year_end == 100:
+    if year_start == 100 and year_end == 100:
         return "extract_all"
     
     # Case 3: change is natural, need to extract specific years
-    elif year_start < 100 and year_end < 100:
+    if year_start < 100 and year_end < 100:
         return "natural"
     
     # Case 4: change is manmade, need to extract specific years
-    elif year_start > 100 and year_end > 100:
+    if year_start > 100 and year_end > 100:
         return "manmade"
     
-    else: 
-        raise ValueError("Changetype must be either 'natural' or 'manmade'")
-
+    return "skip"
+    
+def sort_tiles(tiles_dir, lat_dir, lon_dir):
+    # Get NW tiles
+    tiles = []
+    for lat in range(0, 90, 10):
+        for lon in range(0, 190, 10):
+            # Format lat and lon
+            lat_str=f"{lat:02d}{lat_dir}"
+            lon_str=f"{lon:03d}{lon_dir}"
+            
+            # Construct filepath
+            path = os.path.join(tiles_dir, f"Hansen_GFC-2024-v1.12_lossyear_{lat_str}_{lon_str}_change.tif")
+            if os.path.isfile(path) == False:
+                continue
+            
+            # Add to list
+            tiles.append(path)
+            
+    return sorted(tiles)
+        
+def merge_output(input_tiles, output_tiff):
+    # Build VRT
+    vrt_path = output_tiff.replace(".tif", ".vrt")
+    gdal.BuildVRT(vrt_path, input_tiles)
+    
+    # Merge rasters
+    gdal.Translate(output_tiff, vrt_path, creationOptions=[
+        "COMPRESS=LZW",
+        "TILED=YES",
+        "BLOCKXSIZE=512",
+        "BLOCKYSIZE=512",
+        "BIGTIFF=YES",
+        "NUM_THREADS=25"
+    ])
+    
 
 # =============================================================================
 # Get pixels that the polygon overlaps
 # =============================================================================
-
 def get_pixels(raster_path, polygon_wkt):
     # Load raster, get polygon bounds
     raster, raster_info = get_raster_info(raster_path)
+    if raster is None:
+        raise IOError(f"GDAL could not open raster: {raster_path}")
+    
     band = raster.GetRasterBand(1)
     geom = ogr.CreateGeometryFromWkt(polygon_wkt)
     env = geom.GetEnvelope()
@@ -154,111 +226,119 @@ def write_block(out_band, all_cols, all_rows, all_values, x_off, y_off, cols, ro
         (all_rows >= y_off) & (all_rows < y_off + rows)
     )
 
+    if not block_mask.any():
+        return
+    
     # Initialize the array with zeros
     block_array = np.zeros((rows, cols), dtype=np.uint16)
 
-    if block_mask.any():
-        # Localise coordinates to block-space (0-indexed within this block)
-        local_cols = all_cols[block_mask] - x_off
-        local_rows = all_rows[block_mask] - y_off
-        block_array[local_rows, local_cols] = all_values[block_mask].astype(np.uint16)
+    # Localise coordinates to block-space (0-indexed within this block)
+    local_cols = all_cols[block_mask] - x_off
+    local_rows = all_rows[block_mask] - y_off
+    block_array[local_rows, local_cols] = all_values[block_mask].astype(np.uint16)
 
-    # Write positionally — xoff/yoff tell GDAL where in the full raster this belongs
+    # Write positionally: xoff/yoff tell GDAL where in the full raster this belongs
     out_band.WriteArray(block_array, x_off, y_off)
+
 
 # =============================================================================
 # Extract GFC change per tile
 # =============================================================================
-
 def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     # Step 1: get tile info
-    with console.status(f"Reading {gfc_tile_path}...", spinner="dots"):
-        tile_name = Path(gfc_tile_path).stem
-        _, gfc_info = get_raster_info(gfc_tile_path)
-    console.log(f"✓ Read in {gfc_tile_path}")
+    tile_name = Path(gfc_tile_path).stem
+    _, gfc_info = get_raster_info(gfc_tile_path)
 
     # Step 2: load polygons that intersect the tile
-    with console.status("Finding intersecting polygons...", spinner="dots"):
-        
-        tile_bbox = box(gfc_info["xmin"], gfc_info["ymin"], gfc_info["xmax"], gfc_info["ymax"])
-        gdf = gpd.read_file(training_shp, bbox=tile_bbox)
+    tile_bbox = box(gfc_info["xmin"], gfc_info["ymin"], gfc_info["xmax"], gfc_info["ymax"])
+    gdf = gpd.read_file(training_shp, bbox=tile_bbox)
 
-        # Reproject if necessary
-        tile_epsg = gfc_info["projection"].GetAuthorityCode(None)
-        shp_epsg = gdf.crs.to_epsg()
+    # Reproject if necessary
+    tile_epsg = gfc_info["projection"].GetAuthorityCode(None)
+    shp_epsg = gdf.crs.to_epsg()
 
-        if str(shp_epsg) != tile_epsg:
-            gdf = gdf.to_crs(epsg=int(tile_epsg))
-        
-        if gdf.empty:
-            return {"tile": tile_name, "status": "skipped", "polygon_count": 0}
-        
-    console.log(f"✓ Got {len(gdf)} polygons")
+    if str(shp_epsg) != tile_epsg:
+        gdf = gdf.to_crs(epsg=int(tile_epsg))
+    
+    if gdf.empty:
+        return {"tile": tile_name, "status": "skipped", "polygon_count": 0}
+    
     
     # Step 3: extract pixels under each polygon
     all_cols, all_rows, all_pixels = [], [], []
-    with console.status("Extracting pixels", spinner="dots"):
-        for _, row in gdf.iterrows():
-            # Get polygon info, export geom to wkt
-            year_start = row.get("year_start")
-            year_end = row.get("year_end")
-            mode = classify_change(year_start, year_end)
-            geom_wkt = row.geometry.wkt
-            
-            # Extract pixels under polygon
-            pixels, col_coords, row_coords = get_pixels(gfc_tile_path, geom_wkt)
-            if pixels is None:
+    for _, row in gdf.iterrows():
+        # Get polygon info, export geom to wkt
+        year_start = row.get("year_start")
+        year_end = row.get("year_end")
+        mode = classify_change(year_start, year_end)
+        geom_wkt = row.geometry.wkt
+        
+        # Extract pixels under polygon
+        result = get_pixels(gfc_tile_path, geom_wkt)
+        if result is None:
+            log.debug("No pixels extracted from under polygon")
+            continue
+        
+        pixels, col_coords, row_coords = result
+        if pixels.size == 0:
+            log.debug("Pixels found, however length == 0")
+            continue
+        
+        # Process the pixels according to the mode
+        if mode == "null_both":
+            mode_value = compute_mode_nonzero(pixels)
+            if mode_value is None:
+                log.debug("Mode value is None under polygon")
                 continue
-            if pixels.size == 0:
-                continue
-            
-            # Process the pixels according to the mode
-            if mode == "null_both":
-                mode_value = compute_mode_nonzero(pixels)
-                if mode_value is None:
-                    continue
-                mask = (pixels == mode_value)
-                
-                all_cols.append(col_coords[mask])
-                all_rows.append(row_coords[mask])
-                all_pixels.append(pixels[mask])
-                
-            elif mode == "extract_all":
-                mask = (pixels >= 1) & (pixels <= 24)
-                
-                all_cols.append(col_coords[mask])
-                all_rows.append(row_coords[mask])
-                all_pixels.append(pixels[mask] + 100)
-            
-            elif mode == "natural":
-                mask = (pixels >= year_start) & (pixels <= year_end)
-                
-                all_cols.append(col_coords[mask])
-                all_rows.append(row_coords[mask])
-                all_pixels.append(pixels[mask])
-            
-            elif mode == "manmade":
-                ys = year_start - 100
-                ye = year_end - 100
-                mask = (pixels >= ys) & (pixels <= ye)
-                
-                all_cols.append(col_coords[mask])
-                all_rows.append(row_coords[mask])
-                all_pixels.append(pixels[mask] + 100)
-                
-            else: 
-                continue
-            
+            mask = (pixels == mode_value)
+
             if not mask.any():
+                log.debug("Null_both mode did not create a mask")
                 continue
             
-            # Add pixels to list
             all_cols.append(col_coords[mask])
             all_rows.append(row_coords[mask])
             all_pixels.append(pixels[mask])
-    
-    console.log(f"✓ Extracted {len(all_pixels)} polygons")
-    
+            
+        elif mode == "extract_all":
+            mask = (pixels >= 1) & (pixels <= 24)
+
+            if not mask.any():
+                log.debug("Extract_all mode did not create a mask")
+                continue
+            
+            all_cols.append(col_coords[mask])
+            all_rows.append(row_coords[mask])
+            all_pixels.append(pixels[mask] + 100)
+        
+        elif mode == "natural":
+            mask = (pixels >= year_start) & (pixels <= year_end)
+
+            if not mask.any():
+                log.debug("Natural mode did not create a mask")
+                continue
+            
+            all_cols.append(col_coords[mask])
+            all_rows.append(row_coords[mask])
+            all_pixels.append(pixels[mask])
+        
+        elif mode == "manmade":
+            ys = year_start - 100
+            ye = year_end - 100
+            mask = (pixels >= ys) & (pixels <= ye)
+
+            if not mask.any():
+                log.debug("Manmade mode did not create a mask")
+                continue
+            
+            all_cols.append(col_coords[mask])
+            all_rows.append(row_coords[mask])
+            all_pixels.append(pixels[mask] + 100)
+            
+        else: 
+            log.debug(f"No masking occurred, incorrect mode value: {mode}")
+            continue
+        
     if not all_cols:
         return {"tile": tile_name, "status": "no_change", "polygon_count": len(gdf)}
     
@@ -284,26 +364,15 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     
     # Step 5: write out pixels to new raster matching gfc tile extents
     block_size = 512
-    total_blocks = (gfc_info["cols"] // block_size + 1) * (gfc_info["rows"] // block_size + 1)
-    with Progress(SpinnerColumn(),
-              "[progress.description]{task.description}",
-              MofNCompleteColumn(),
-              TimeElapsedColumn(),
-              transient=True) as progress:
-        task = progress.add_task("Writing out raster in blocks...", total=total_blocks)
-
-        for y in range(0, gfc_info["rows"] + 1, block_size):
-            rows = min(block_size, gfc_info["rows"] - y)  # Handles edge case for remaining rows
-            for x in range(0, gfc_info["cols"] + 1, block_size):
-                cols = min(block_size, gfc_info["cols"] - x)  # Handles edge case for remaining cols
-                write_block(
-                    output_band, all_cols, all_rows, all_values,
-                    x, y, cols, rows
-                )
-                progress.update(task, advance=1)
+    for y in range(0, gfc_info["rows"] + 1, block_size):
+        rows = min(block_size, gfc_info["rows"] - y)  # Handles edge case for remaining rows
+        for x in range(0, gfc_info["cols"] + 1, block_size):
+            cols = min(block_size, gfc_info["cols"] - x)  # Handles edge case for remaining cols
+            write_block(
+                output_band, all_cols, all_rows, all_values,
+                x, y, cols, rows
+            )
         
-    console.log("✓ Wrote out raster")
-
     output.FlushCache()    
     output = None
     
@@ -315,8 +384,91 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
         "output":        output_tiff,
     }
     
-gfc_tile = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles/Hansen_GFC-2024-v1.12_lossyear_40N_100W.tif"
-training_shp = "/gpfs/glad1/Theo/Shapefiles/GFC/gfc_training.shp"
-output_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/test"
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    # Make output folders (which are nested)
+    output_tiles_dir = os.path.join(OUTPUT_DIR, "tiles")
+    os.makedirs(output_tiles_dir, exist_ok=True)
+    
+    # Get all tile paths
+    tile_paths = sorted([os.path.join(GFC_TILES, tile) for tile in os.listdir(GFC_TILES) if tile.endswith(".tif")])
+    
+    # Build list of arguments
+    worker_args = [
+        (tile_path, TRAINING_SHP, output_tiles_dir)
+        for tile_path in tile_paths
+    ]
+    
+    # Parallel process
+    completed_tiles = []
+    with Progress(
+        SpinnerColumn(),
+        "[progress.description]{task.description}",
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
 
-completed_tiles = extract_gfc_change(gfc_tile, training_shp, output_dir)
+        task = progress.add_task("Processing tiles...", total=len(worker_args))
+
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+            futures = {pool.submit(extract_gfc_change, *args): args[0] for args in worker_args}
+
+            for future in as_completed(futures):
+                tile_path = futures[future]
+                try:
+                    result = future.result()
+                    if result["status"] == "success":
+                        completed_tiles.append(result["output"])
+                        log.info(f"{result['tile']}: {result['status']}")
+                    elif result["status"] == "skipped":
+                        log.warning(f"{result['tile']}: no intersecting polygons, skipped")
+                    else:
+                        log.error(f"{result['tile']}: {result.get('reason', 'unknown error')}")
+                except Exception as exc:
+                    log.error(f"{tile_path} failed: {exc}")
+                finally:
+                    progress.update(task, advance=1)
+
+    log.info(f"{len(completed_tiles)} tiles written successfully.")
+    
+    # Merge the output
+    if completed_tiles:
+        # Get tile lists per quadrant
+        tiles_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_2_2026/tiles"
+        nw_tiles = sort_tiles(tiles_dir, "N", "W")
+        ne_tiles = sort_tiles(tiles_dir, "N", "E")
+        sw_tiles = sort_tiles(tiles_dir, "S", "W")
+        se_tiles = sort_tiles(tiles_dir, "S", "E")
+        
+        # Set up output tiffs
+        output_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_2_2026"
+        nw_tiff = os.path.join(output_dir, "NW_forest_change.tif")
+        ne_tiff = os.path.join(output_dir, "NE_forest_change.tif")
+        sw_tiff = os.path.join(output_dir, "SW_forest_change.tif")
+        se_tiff = os.path.join(output_dir, "SE_forest_change.tif")
+        
+        # Call in parallel
+        worker_args = [
+            (nw_tiles, nw_tiff),
+            (ne_tiles, ne_tiff),
+            (sw_tiles, sw_tiff),
+            (se_tiles, se_tiff)
+        ]
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(merge_output, *args): args[1] for args in worker_args}
+            for future in as_completed(futures):
+                output_tiff = futures[future]
+                try:
+                    future.result()
+                    log.info(f"Completed: {output_tiff}")
+                except Exception as e:
+                    log.error(f"Failed {output_tiff}: {e}")
+                    
+        
+if __name__ == "__main__":
+    main()
