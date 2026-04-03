@@ -18,6 +18,9 @@ gdal.UseExceptions()
 # =============================================================================
 # GLOBALS
 # =============================================================================
+gfc_tile = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles/Hansen_GFC-2024-v1.12_lossyear_40N_080W.tif"
+output_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/test"
+
 GFC_TILES = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles"
 TRAINING_SHP = "/gpfs/glad1/Theo/Shapefiles/GFC/gfc_training.shp"
 OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_3_2026"
@@ -37,7 +40,7 @@ logging.basicConfig(
             log_time_format="[%H:%M:%S]"
         ),
         logging.FileHandler(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfc_extractor.log"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "log_gfc_extractor.log"),
             mode="w"
         )
     ]
@@ -73,6 +76,7 @@ def compute_mode_nonzero(pixels):
     
     mode_result = stats.mode(change_pixels, keepdims=False)
     
+    log.debug(f"Compute_mode: mode = {int(mode_result.mode)}")
     return int(mode_result.mode)
 
 def classify_change(year_start, year_end):
@@ -276,24 +280,20 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
         # Extract pixels under polygon
         result = get_pixels(gfc_tile_path, geom_wkt)
         if result is None:
-            log.debug("No pixels extracted from under polygon")
             continue
         
         pixels, col_coords, row_coords = result
         if pixels.size == 0:
-            log.debug("Pixels found, however length == 0")
             continue
         
         # Process the pixels according to the mode
         if mode == "null_both":
             mode_value = compute_mode_nonzero(pixels)
             if mode_value is None:
-                log.debug("Mode value is None under polygon")
                 continue
             mask = (pixels == mode_value)
 
             if not mask.any():
-                log.debug("Null_both mode did not create a mask")
                 continue
             
             all_cols.append(col_coords[mask])
@@ -304,7 +304,6 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             mask = (pixels >= 1) & (pixels <= 24)
 
             if not mask.any():
-                log.debug("Extract_all mode did not create a mask")
                 continue
             
             all_cols.append(col_coords[mask])
@@ -315,7 +314,6 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             mask = (pixels >= year_start) & (pixels <= year_end)
 
             if not mask.any():
-                log.debug("Natural mode did not create a mask")
                 continue
             
             all_cols.append(col_coords[mask])
@@ -328,7 +326,6 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             mask = (pixels >= ys) & (pixels <= ye)
 
             if not mask.any():
-                log.debug("Manmade mode did not create a mask")
                 continue
             
             all_cols.append(col_coords[mask])
@@ -336,7 +333,6 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             all_pixels.append(pixels[mask] + 100)
             
         else: 
-            log.debug(f"No masking occurred, incorrect mode value: {mode}")
             continue
         
     if not all_cols:
@@ -364,9 +360,9 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     
     # Step 5: write out pixels to new raster matching gfc tile extents
     block_size = 512
-    for y in range(0, gfc_info["rows"] + 1, block_size):
+    for y in range(0, gfc_info["rows"], block_size):
         rows = min(block_size, gfc_info["rows"] - y)  # Handles edge case for remaining rows
-        for x in range(0, gfc_info["cols"] + 1, block_size):
+        for x in range(0, gfc_info["cols"], block_size):
             cols = min(block_size, gfc_info["cols"] - x)  # Handles edge case for remaining cols
             write_block(
                 output_band, all_cols, all_rows, all_values,
@@ -438,18 +434,16 @@ def main():
     # Merge the output
     if completed_tiles:
         # Get tile lists per quadrant
-        tiles_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_2_2026/tiles"
-        nw_tiles = sort_tiles(tiles_dir, "N", "W")
-        ne_tiles = sort_tiles(tiles_dir, "N", "E")
-        sw_tiles = sort_tiles(tiles_dir, "S", "W")
-        se_tiles = sort_tiles(tiles_dir, "S", "E")
+        nw_tiles = sort_tiles(output_tiles_dir, "N", "W")
+        ne_tiles = sort_tiles(output_tiles_dir, "N", "E")
+        sw_tiles = sort_tiles(output_tiles_dir, "S", "W")
+        se_tiles = sort_tiles(output_tiles_dir, "S", "E")
         
         # Set up output tiffs
-        output_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_2_2026"
-        nw_tiff = os.path.join(output_dir, "NW_forest_change.tif")
-        ne_tiff = os.path.join(output_dir, "NE_forest_change.tif")
-        sw_tiff = os.path.join(output_dir, "SW_forest_change.tif")
-        se_tiff = os.path.join(output_dir, "SE_forest_change.tif")
+        nw_tiff = os.path.join(OUTPUT_DIR, "NW_forest_change.tif")
+        ne_tiff = os.path.join(OUTPUT_DIR, "NE_forest_change.tif")
+        sw_tiff = os.path.join(OUTPUT_DIR, "SW_forest_change.tif")
+        se_tiff = os.path.join(OUTPUT_DIR, "SE_forest_change.tif")
         
         # Call in parallel
         worker_args = [
@@ -471,4 +465,5 @@ def main():
                     
         
 if __name__ == "__main__":
-    main()
+    # main()
+    extract_gfc_change(gfc_tile, TRAINING_SHP, output_dir)
