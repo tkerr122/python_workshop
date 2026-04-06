@@ -11,27 +11,24 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
 import numpy as np
 import geopandas as gpd
-import os, logging
+import os, logging, math
 console = Console()
 gdal.UseExceptions()
 
 # =============================================================================
 # GLOBALS
 # =============================================================================
-gfc_tile = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles/Hansen_GFC-2024-v1.12_lossyear_40N_080W.tif"
-output_dir = "/gpfs/glad1/Theo/Data/Global_Forest_Change/test"
-
 GFC_TILES = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles"
 TRAINING_SHP = "/gpfs/glad1/Theo/Shapefiles/GFC/gfc_training.shp"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_3_2026"
-N_WORKERS = 180
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_6_2026"
+N_WORKERS = 150
 
 # -----------------------------------------------------------------------------
 # Logging setup using Rich
 # -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",  # richer format for the file
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         RichHandler(
             console=console,
@@ -167,8 +164,8 @@ def get_pixels(raster_path, polygon_wkt):
     win_y_min = max(poly_y_min, raster_info["ymin"])
     win_y_max = min(poly_y_max, raster_info["ymax"])
 
-    col_off  = int((win_x_min - raster_info["transform"][0]) / raster_info["transform"][1])
-    row_off  = int((win_y_max - raster_info["transform"][3]) / raster_info["transform"][5])
+    col_off  = math.floor((win_x_min - raster_info["transform"][0]) / raster_info["transform"][1])
+    row_off  = math.floor((win_y_max - raster_info["transform"][3]) / raster_info["transform"][5])
     win_cols = max(1, int(np.ceil((win_x_max - win_x_min) / raster_info["transform"][1])))
     win_rows = max(1, int(np.ceil((win_y_max - win_y_min) / abs(raster_info["transform"][5]))))
 
@@ -215,7 +212,7 @@ def get_pixels(raster_path, polygon_wkt):
     abs_col_coords = win_cols_idx + col_off
     abs_row_coords = win_rows_idx + row_off
 
-    pixels = pixel_array[polygon_mask == 1].astype(np.int16)
+    pixels = pixel_array[polygon_mask == 1].astype(np.uint8)
     
     return pixels, abs_col_coords, abs_row_coords
 
@@ -234,12 +231,12 @@ def write_block(out_band, all_cols, all_rows, all_values, x_off, y_off, cols, ro
         return
     
     # Initialize the array with zeros
-    block_array = np.zeros((rows, cols), dtype=np.uint16)
+    block_array = np.zeros((rows, cols), dtype=np.uint8)
 
     # Localise coordinates to block-space (0-indexed within this block)
     local_cols = all_cols[block_mask] - x_off
     local_rows = all_rows[block_mask] - y_off
-    block_array[local_rows, local_cols] = all_values[block_mask].astype(np.uint16)
+    block_array[local_rows, local_cols] = all_values[block_mask].astype(np.uint8)
 
     # Write positionally: xoff/yoff tell GDAL where in the full raster this belongs
     out_band.WriteArray(block_array, x_off, y_off)
@@ -340,13 +337,13 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     
     all_cols   = np.concatenate(all_cols)
     all_rows   = np.concatenate(all_rows)
-    all_values = np.concatenate(all_pixels).astype(np.uint16)
+    all_values = np.concatenate(all_pixels).astype(np.uint8)
     
     # Step 4: set up output tiff
     os.makedirs(output_dir, exist_ok=True)
     output_tiff = os.path.join(output_dir, f"{tile_name}_change.tif")
     output = gdal.GetDriverByName("GTiff").Create(
-        output_tiff, gfc_info["cols"], gfc_info["rows"], 1, gdal.GDT_UInt16, options=[
+        output_tiff, gfc_info["cols"], gfc_info["rows"], 1, gdal.GDT_Byte, options=[
             "COMPRESS=LZW",
             "TILED=YES",
             "BIGTIFF=YES"
@@ -355,8 +352,8 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     output.SetGeoTransform(gfc_info["transform"])
     output.SetProjection(gfc_info["projection"].ExportToWkt())
     output_band = output.GetRasterBand(1)
+    output_band.Fill(255)
     output_band.SetNoDataValue(255)
-    output_band.Fill(0)
     
     # Step 5: write out pixels to new raster matching gfc tile extents
     block_size = 512
@@ -465,5 +462,4 @@ def main():
                     
         
 if __name__ == "__main__":
-    # main()
-    extract_gfc_change(gfc_tile, TRAINING_SHP, output_dir)
+    main()
