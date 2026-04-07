@@ -1,6 +1,4 @@
-# Python workshop
-
-All my work in progress files
+# Python workshop - All my work in progress files
 ---
 
 ## Scripts
