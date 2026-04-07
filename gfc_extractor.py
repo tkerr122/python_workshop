@@ -21,7 +21,7 @@ gdal.UseExceptions()
 GFC_TILES = "/gpfs/glad1/Theo/Data/Global_Forest_Change/gfc_tiles"
 TRAINING_SHP = "/gpfs/glad1/Theo/Shapefiles/GFC/gfc_training.shp"
 OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Global_Forest_Change/output_training_4_6_2026"
-N_WORKERS = 150
+N_WORKERS = 200
 
 # -----------------------------------------------------------------------------
 # Logging setup using Rich
@@ -231,7 +231,7 @@ def write_block(out_band, all_cols, all_rows, all_values, x_off, y_off, cols, ro
         return
     
     # Initialize the array with zeros
-    block_array = np.zeros((rows, cols), dtype=np.uint8)
+    block_array = np.full((rows, cols), fill_value=255, dtype=np.uint8)
 
     # Localise coordinates to block-space (0-indexed within this block)
     local_cols = all_cols[block_mask] - x_off
@@ -288,7 +288,7 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             mode_value = compute_mode_nonzero(pixels)
             if mode_value is None:
                 continue
-            mask = (pixels == mode_value)
+            mask = (pixels == mode_value) | (pixels == 0)
 
             if not mask.any():
                 continue
@@ -296,19 +296,9 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             all_cols.append(col_coords[mask])
             all_rows.append(row_coords[mask])
             all_pixels.append(pixels[mask])
-            
-        elif mode == "extract_all":
-            mask = (pixels >= 1) & (pixels <= 24)
-
-            if not mask.any():
-                continue
-            
-            all_cols.append(col_coords[mask])
-            all_rows.append(row_coords[mask])
-            all_pixels.append(pixels[mask] + 100)
-        
+                    
         elif mode == "natural":
-            mask = (pixels >= year_start) & (pixels <= year_end)
+            mask = ((pixels >= year_start) & (pixels <= year_end)) | (pixels == 0)
 
             if not mask.any():
                 continue
@@ -317,17 +307,33 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
             all_rows.append(row_coords[mask])
             all_pixels.append(pixels[mask])
         
+        elif mode == "extract_all":
+            mask = ((pixels >= 1) & (pixels <= 24)) | (pixels == 0)
+
+            if not mask.any():
+                continue
+            
+            # Adjust to treat zeros properly
+            adjusted = np.where(pixels[mask] > 0, pixels[mask] + 100, 0).astype(np.uint8)
+            
+            all_cols.append(col_coords[mask])
+            all_rows.append(row_coords[mask])
+            all_pixels.append(adjusted)
+            
         elif mode == "manmade":
             ys = year_start - 100
             ye = year_end - 100
-            mask = (pixels >= ys) & (pixels <= ye)
+            mask = ((pixels >= ys) & (pixels <= ye)) | (pixels == 0)
 
             if not mask.any():
                 continue
             
+            # Adjust to treat zeros properly
+            adjusted = np.where(pixels[mask] > 0, pixels[mask] + 100, 0).astype(np.uint8)
+            
             all_cols.append(col_coords[mask])
             all_rows.append(row_coords[mask])
-            all_pixels.append(pixels[mask] + 100)
+            all_pixels.append(adjusted)
             
         else: 
             continue
@@ -352,7 +358,6 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
     output.SetGeoTransform(gfc_info["transform"])
     output.SetProjection(gfc_info["projection"].ExportToWkt())
     output_band = output.GetRasterBand(1)
-    output_band.Fill(255)
     output_band.SetNoDataValue(255)
     
     # Step 5: write out pixels to new raster matching gfc tile extents
