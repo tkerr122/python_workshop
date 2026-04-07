@@ -48,6 +48,15 @@ log = logging.getLogger(__name__)
 # Utility functions
 # =============================================================================
 def get_raster_info(raster_path):
+    """Opens a raster dataset in GDAL and returns the dataset object and an
+    info dictionary.
+
+    Args:
+        raster_path (str): path to the raster.
+
+    Returns:
+        tuple: dataset object, info dictionary
+    """
     ds = gdal.Open(raster_path, gdal.GA_ReadOnly)
     cols = ds.RasterXSize
     rows = ds.RasterYSize
@@ -67,6 +76,14 @@ def get_raster_info(raster_path):
     return ds, info
 
 def compute_mode_nonzero(pixels):
+    """Computes the mode value for an input array.
+
+    Args:
+        pixels (np.array): array to find the mode value for.
+
+    Returns:
+        int: mode value for array.
+    """
     change_pixels = pixels[pixels != 0]
     if change_pixels.size == 0:
         return None
@@ -77,6 +94,15 @@ def compute_mode_nonzero(pixels):
     return int(mode_result.mode)
 
 def classify_change(year_start, year_end):
+    """Find the type of change based on values of start and end year.
+
+    Args:
+        year_start (int): start of change.
+        year_end (int): end of change.
+
+    Returns:
+        str: type of change.
+    """
     # Setup: treat pandas NA, None, and float NaN uniformly
     start_null = (year_start is None) or (
         isinstance(year_start, float) and np.isnan(year_start)
@@ -104,6 +130,16 @@ def classify_change(year_start, year_end):
     return "skip"
     
 def sort_tiles(tiles_dir, lat_dir, lon_dir):
+    """Loops through tile sequence and generates list of tile paths.
+
+    Args:
+        tiles_dir (str): folder with raster tiles.
+        lat_dir (str): which hemisphere, N or S.
+        lon_dir (str): which hemisphere, E or W.
+
+    Returns:
+        list: sorted list of filepaths
+    """
     # Get NW tiles
     tiles = []
     for lat in range(0, 90, 10):
@@ -123,6 +159,12 @@ def sort_tiles(tiles_dir, lat_dir, lon_dir):
     return sorted(tiles)
         
 def merge_output(input_tiles, output_tiff):
+    """Merges a folder of raster tiles into one output tiff.
+
+    Args:
+        input_tiles (str): folder with raster tiles.
+        output_tiff (str): path to output tiff
+    """
     # Build VRT
     vrt_path = output_tiff.replace(".tif", ".vrt")
     gdal.BuildVRT(vrt_path, input_tiles)
@@ -137,11 +179,30 @@ def merge_output(input_tiles, output_tiff):
         "NUM_THREADS=25"
     ])
     
+    # Remove VRT
+    os.remove(vrt_path)
+    
 
 # =============================================================================
 # Get pixels that the polygon overlaps
 # =============================================================================
 def get_pixels(raster_path, polygon_wkt):
+    """Using array indexing, finds areas of a raster that intersect with the 
+    given polygon, and returns arrays for the pixels, the columns, and the 
+    rows.
+
+    Args:
+        raster_path (str): path to raster.
+        polygon_wkt (str): WKT geometry to intersect with.
+
+    Raises:
+        IOError: Error if GDAL couldn't open the raster.
+
+    Returns:
+        np.array: arrays of the pixels and their columns and rows in the 
+        parent raster.
+        
+    """
     # Load raster, get polygon bounds
     raster, raster_info = get_raster_info(raster_path)
     if raster is None:
@@ -221,6 +282,19 @@ def get_pixels(raster_path, polygon_wkt):
 # Write output for a block
 # =============================================================================
 def write_block(out_band, all_cols, all_rows, all_values, x_off, y_off, cols, rows):
+    """Uses masking to write out the pixels if they are present in the 
+    specified block's location.
+
+    Args:
+        out_band (gdal): band to write the array to.
+        all_cols (np.array): array of all the column positions.
+        all_rows (np.array): array of all the row positions.
+        all_values (np.array): all the pixel values of the raster.
+        x_off (int): x offset of the current block.
+        y_off (int): y offset of the current block.
+        cols (int): number of columns in the raster.
+        rows (int): number of rows in the raster.
+    """
     # Create a mask for the current section of the raster
     block_mask = (
         (all_cols >= x_off) & (all_cols < x_off + cols) &
@@ -246,6 +320,17 @@ def write_block(out_band, all_cols, all_rows, all_values, x_off, y_off, cols, ro
 # Extract GFC change per tile
 # =============================================================================
 def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
+    """Main function to extract the GFC change values from the given GFC tile,
+    using the training_shp and writing the output to the specified path.
+
+    Args:
+        gfc_tile_path (str): path to the GFC tile.
+        training_shp (str): path to the training shp.
+        output_dir (str): path to the output folder.
+
+    Returns:
+        dict: dictionary with status messaging used for logging.
+    """
     # Step 1: get tile info
     tile_name = Path(gfc_tile_path).stem
     _, gfc_info = get_raster_info(gfc_tile_path)
@@ -386,6 +471,11 @@ def extract_gfc_change(gfc_tile_path, training_shp, output_dir):
 # MAIN
 # =============================================================================
 def main():
+    """
+    Main function that uses parallel processing to extract GFC change from 
+    tiles in parallel, and then merges the output tiles into 4 rasters for each
+    hemisphere of the globe.
+    """
     # Make output folders (which are nested)
     output_tiles_dir = os.path.join(OUTPUT_DIR, "tiles")
     os.makedirs(output_tiles_dir, exist_ok=True)
