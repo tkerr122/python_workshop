@@ -18,12 +18,12 @@ console = Console()
 # =============================================================================
 # GLOBALS
 # =============================================================================
-BLOCK_ID = 0
+BLOCK_ID = [0, 1]
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_rasters.tif"
 OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output/v2"
 N_WORKERS = 100
-BLOCKSIZE = 512
-BUFFER_DIST = 256
+BLOCKSIZE = 2048
+BUFFER_DIST = 1024
 GAP_THRESHOLD = 100
 PROBABILITY_THRESHOLD = 10
 
@@ -241,6 +241,22 @@ def find_enclosed_polygons(closed_lines: np.ndarray, block_info: BlockInfo, rast
     
     mem_band = mem_ds.GetRasterBand(1)
     mem_band.SetNoDataValue(0)
+
+    # ---DEBUG: create tiffs for closed lines
+    output_lines = os.path.join(OUTPUT_DIR, f"lines_{block_info.block_id}.tif")
+    interior_lines = closed_lines[r0:r0 + block_info.block_height,  # Top and bottom rows
+                                     c0:c0 + block_info.block_width]   # Left and right columns
+
+    output_lines_ds = gdal.GetDriverByName("GTiff").Create(
+        output_lines, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
+    )
+    output_lines_ds.SetGeoTransform(gt)
+    output_lines_ds.SetProjection(raster_info.projection.ExportToWkt())
+    
+    output_lines_band = output_lines_ds.GetRasterBand(1)
+    output_lines_band.SetNoDataValue(0)
+    output_lines_band.WriteArray(interior_lines)
+    output_lines_ds = None
     
     # Create blank vector dataset in memory for polygonization
     temp_vector = ogr.GetDriverByName("Memory").CreateDataSource("")
@@ -361,38 +377,46 @@ def main():
     output_vector = None
     
 if __name__ == "__main__":
-    main()
-    
-    # log.debug("Getting raster info")
-    
-    # info = get_raster_info(INPUT_RASTER)
-    
-    # log.debug(f"Extracting polygons for block {BLOCK_ID}")
-    
-    # result = extract_polygons(BLOCK_ID, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD)
-    
-    # output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
-    # output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
-    # output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
-    # fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    # output_layer.CreateField(fieldname)
-    
-    # with Progress(
-    #     SpinnerColumn(),
-    #     "[progress.description]{task.description}",
-    #     MofNCompleteColumn(),
-    #     TimeElapsedColumn(),
-    #     console=console,
-    #     transient=True,
-    # ) as progress:
+    # main()
 
-    #     task = progress.add_task("Writing polygons...", total=len(result["polygons"]))
-        
-    #     for b_id, wkt_geom in result["polygons"]:
-    #         feat = ogr.Feature(output_layer.GetLayerDefn())
-    #         feat.SetField("block_id", b_id)
-    #         feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
-    #         output_layer.CreateFeature(feat)
-    #         feat = None
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    log.debug("Getting raster info")
+    
+    info = get_raster_info(INPUT_RASTER)
+    
+    log.debug(f"Extracting polygons for block {BLOCK_ID}")
+    
+    polygons = []
+    for id in BLOCK_ID:
+        result = extract_polygons(id, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD)
+        polygons.extend(result["polygons"])
+
+    output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
+    output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
+    output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
+    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
+    output_layer.CreateField(fieldname)
+    
+    if len(polygons) > 0:
+        with Progress(
+            SpinnerColumn(),
+            "[progress.description]{task.description}",
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+
+            task = progress.add_task("Writing polygons...", total=len(polygons))
             
-    # output_vector = None
+            # for b_id, wkt_geom in result["polygons"]:
+            for b_id, wkt_geom in polygons:
+                feat = ogr.Feature(output_layer.GetLayerDefn())
+                feat.SetField("block_id", b_id)
+                feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
+                output_layer.CreateFeature(feat)
+                feat = None
+
+                progress.update(task, advance=1)
+            
+    output_vector = None
