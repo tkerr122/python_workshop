@@ -339,61 +339,22 @@ def main():
         task = progress.add_task("Getting polygons by block...", total=len(worker_args))
 
         with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-            try:
-                futures = {pool.submit(extract_polygons, *args): args[0] for args in worker_args}
-                
-                # Set up batched writing to output vector
-                output_layer.StartTransaction()
-                pending = 0
-                commit_interval = 1000
-
-                for future in as_completed(futures):
-                    block_id = futures[future]
-                    try:
-                        result = future.result()
-                        if result["status"] == "success":
-                            completed_blocks.append(result["block_id"])
-                            log.info(f"{result['block_id']}: {result['status']}")
-                            
-                            # If successful, write polygons in batches
-                            try:
-                                for b_id, wkt_geom in result["polygons"]:
-                                    feat = ogr.Feature(output_layer.GetLayerDefn())
-                                    feat.SetField("block_id", b_id)
-                                    feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
-                                    output_layer.CreateFeature(feat)
-                                    pending += 1
-                                    
-                                    if pending >= commit_interval:
-                                        output_layer.CommitTransaction()
-                                        output_layer.StartTransaction()
-                                        pending = 0
-                                        
-                                if pending > 0:
-                                    output_layer.CommitTransaction()
-                            
-                            except Exception:
-                                output_layer.RollbackTransaction()
-                                output_layer.StartTransaction()
-                                pending = 0
-                                raise
-                                
-                        elif result["status"] == "null":
-                            log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
-                            
-                        else:
-                            log.error(f"{result['block_id']}: {result.get('reason', 'unknown error')}")
-                            
-                    except Exception as exc:
-                        log.error(f"{block_id} failed: {exc}")
-                        
-                    finally:
-                        progress.update(task, advance=1)
-                        
-            except KeyboardInterrupt:
-                log.warning("Keyboard interrupt received, shutting down workers...")
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
+            futures = {pool.submit(extract_polygons, *args): args[0] for args in worker_args}
+            for future in as_completed(futures):
+                block_id = futures[future]
+                try:
+                    result = future.result()
+                    if result["status"] == "success":
+                        completed_blocks.append(result["block_id"])
+                        log.info(f"{result['block_id']}: {result['status']}")
+                    elif result["status"] == "null":
+                        log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
+                    else:
+                        log.error(f"{result['block_id']}: {result.get('reason', 'unknown error')}")
+                except Exception as exc:
+                    log.error(f"{block_id} failed: {exc}")
+                finally:
+                    progress.update(task, advance=1)
 
     log.info(f"{len(completed_blocks)} blocks written successfully.")
     
