@@ -2,7 +2,7 @@
 from osgeo import gdal, ogr, osr
 from scipy import ndimage
 from skimage.morphology import skeletonize, disk
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.logging import RichHandler
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
@@ -20,7 +20,7 @@ console = Console()
 # =============================================================================
 BLOCK_ID = 0
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_rasters.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output/v2"
 N_WORKERS = 100
 BLOCKSIZE = 512
 BUFFER_DIST = 256
@@ -176,7 +176,7 @@ def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_thresho
     if not block.any():
         log.debug("Block load failed, block array is empty")
     
-    return block, block_info
+    return block, block_info, raster_info
 
 def get_interior(closed_lines):
     # Find the pixels that are fully enclosed by lines and not lines
@@ -232,18 +232,18 @@ def find_enclosed_polygons(closed_lines: np.ndarray, block_info: BlockInfo, rast
     gt = list(raster_info.transform)
     gt[0] = raster_info.xmin + block_info.block_col * raster_info.pixel_width  # x origin
     gt[3] = raster_info.ymax + block_info.block_row * raster_info.pixel_height # y origin
-    
+        
     mem_ds = gdal.GetDriverByName("MEM").Create(
         "", block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
     )
     mem_ds.SetGeoTransform(gt)
-    mem_ds.SetProjection(raster_info.projection.ExportToWKT())
+    mem_ds.SetProjection(raster_info.projection.ExportToWkt())
     
     mem_band = mem_ds.GetRasterBand(1)
     mem_band.SetNoDataValue(0)
     
     # Create blank vector dataset in memory for polygonization
-    temp_vector = ogr.GetDriverByName("Memory").CreateDataSource(output_vector)
+    temp_vector = ogr.GetDriverByName("Memory").CreateDataSource("")
     temp_layer = temp_vector.CreateLayer("enclosed_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon)
     fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
     temp_layer.CreateField(fieldname)
@@ -281,6 +281,7 @@ def extract_polygons(block_id, input_raster_path, blocksize, buffer_dist, gap_th
     # Step 3: find enclosed polygons
     polygons = find_enclosed_polygons(closed_lines, block_info, raster_info)
     if polygons == 0:
+        log.debug("no enclosed polygons found")
         return {
             "block_id": block_id,
             "status": "null",
@@ -300,20 +301,16 @@ def extract_polygons(block_id, input_raster_path, blocksize, buffer_dist, gap_th
 # MAIN
 # =============================================================================
 def main():
-    # Make output folders (which are nested)
-    output_block_dir = os.path.join(OUTPUT_DIR, "blocks")
-    os.makedirs(output_block_dir, exist_ok=True)
+    # Make output folder
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # Open raster dataset and get number of blocks
-    ds = gdal.Open(INPUT_RASTER, gdal.GA_ReadOnly)
-    if ds is None:
-        raise FileNotFoundError(f"Cannot open raster: {INPUT_RASTER}")
+    log.debug("Getting raster info")
+    info = get_raster_info(INPUT_RASTER)
     
-    nx = math.ceil(ds.RasterXSize / BLOCKSIZE)
-    ny = math.ceil(ds.RasterYSize / BLOCKSIZE)
+    nx = math.ceil(info.cols / BLOCKSIZE)
+    ny = math.ceil(info.rows / BLOCKSIZE)
     total_blocks = nx * ny
-    
-    ds = None
     
     # Create output geopackage for polygons
     output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
@@ -342,85 +339,99 @@ def main():
         task = progress.add_task("Getting polygons by block...", total=len(worker_args))
 
         with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-            futures = {pool.submit(extract_polygons, *args): args[0] for args in worker_args}
-            
-            # Set up batched writing to output vector
-            output_layer.StartTransaction()
-            pending = 0
-            commit_interval = 1000
+            try:
+                futures = {pool.submit(extract_polygons, *args): args[0] for args in worker_args}
+                
+                # Set up batched writing to output vector
+                output_layer.StartTransaction()
+                pending = 0
+                commit_interval = 1000
 
-            for future in as_completed(futures):
-                block_id = futures[future]
-                try:
-                    result = future.result()
-                    if result["status"] == "success":
-                        completed_blocks.append(result["block_id"])
-                        log.info(f"{result['block_id']}: {result['status']}")
-                        
-                        # If successful, write polygons in batches
-                        for b_id, wkt_geom in result["polygons"]:
-                            feat = ogr.Feature(output_layer.GetLayerDefn())
-                            feat.SetField("block_id", b_id)
-                            feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
-                            output_layer.CreateFeature(feat)
-                            pending += 1
+                for future in as_completed(futures):
+                    block_id = futures[future]
+                    try:
+                        result = future.result()
+                        if result["status"] == "success":
+                            completed_blocks.append(result["block_id"])
+                            log.info(f"{result['block_id']}: {result['status']}")
                             
-                            if pending >= commit_interval:
-                                output_layer.CommitTransaction()
+                            # If successful, write polygons in batches
+                            try:
+                                for b_id, wkt_geom in result["polygons"]:
+                                    feat = ogr.Feature(output_layer.GetLayerDefn())
+                                    feat.SetField("block_id", b_id)
+                                    feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
+                                    output_layer.CreateFeature(feat)
+                                    pending += 1
+                                    
+                                    if pending >= commit_interval:
+                                        output_layer.CommitTransaction()
+                                        output_layer.StartTransaction()
+                                        pending = 0
+                                        
+                                if pending > 0:
+                                    output_layer.CommitTransaction()
+                            
+                            except Exception:
+                                output_layer.RollbackTransaction()
                                 output_layer.StartTransaction()
                                 pending = 0
+                                raise
                                 
-                        if pending > 0:
-                            output_layer.CommitTransaction()                        
+                        elif result["status"] == "null":
+                            log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
                             
-                    elif result["status"] == "null":
-                        log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
+                        else:
+                            log.error(f"{result['block_id']}: {result.get('reason', 'unknown error')}")
+                            
+                    except Exception as exc:
+                        log.error(f"{block_id} failed: {exc}")
                         
-                    else:
-                        log.error(f"{result['block_id']}: {result.get('reason', 'unknown error')}")
+                    finally:
+                        progress.update(task, advance=1)
                         
-                except Exception as exc:
-                    log.error(f"{block_id} failed: {exc}")
-                    
-                finally:
-                    progress.update(task, advance=1)
+            except KeyboardInterrupt:
+                log.warning("Keyboard interrupt received, shutting down workers...")
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
 
     log.info(f"{len(completed_blocks)} blocks written successfully.")
     
     output_vector = None
     
 if __name__ == "__main__":
-    # main()
+    main()
     
-    log.debug("Getting raster info")
+    # log.debug("Getting raster info")
     
-    info = get_raster_info(INPUT_RASTER)
+    # info = get_raster_info(INPUT_RASTER)
     
-    log.debug(f"Extracting polygons for block {BLOCK_ID}")
+    # log.debug(f"Extracting polygons for block {BLOCK_ID}")
     
-    result, polygons = extract_polygons()
+    # result = extract_polygons(BLOCK_ID, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD)
     
-    output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
-    output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
-    output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
-    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    output_layer.CreateField(fieldname)
+    # output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
+    # output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
+    # output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
+    # fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
+    # output_layer.CreateField(fieldname)
     
-    with Progress(
-        SpinnerColumn(),
-        "[progress.description]{task.description}",
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
+    # with Progress(
+    #     SpinnerColumn(),
+    #     "[progress.description]{task.description}",
+    #     MofNCompleteColumn(),
+    #     TimeElapsedColumn(),
+    #     console=console,
+    #     transient=True,
+    # ) as progress:
 
-        task = progress.add_task("Writing polygons...", total=len(polygons))
+    #     task = progress.add_task("Writing polygons...", total=len(result["polygons"]))
         
-        for b_id, wkt_geom in polygons:
-            feat = ogr.Feature(output_layer.GetLayerDefn())
-            feat.SetField("block_id", b_id)
-            feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
-            output_layer.CreateFeature(feat)
+    #     for b_id, wkt_geom in result["polygons"]:
+    #         feat = ogr.Feature(output_layer.GetLayerDefn())
+    #         feat.SetField("block_id", b_id)
+    #         feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
+    #         output_layer.CreateFeature(feat)
+    #         feat = None
             
-    output_vector = None
+    # output_vector = None
