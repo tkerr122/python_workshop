@@ -22,22 +22,16 @@ console = Console()
 # NOTES
 # =============================================================================
 NEXT STAGE:
-- I think trying the pixel gap closing rather than vector may work better, the 
-output from the old vector script still retains sub-threshold gaps and needs 
-debugging
-- Need to remove small areas
-- Need to modify to write polygons to disk per block, instead of storing in 
-list object (gdal.VectorTranslate?)
+- Need to figure out how to merge the flatgeobufs at the end
 """
 
 
 # =============================================================================
 # GLOBALS
 # =============================================================================
-BLOCK_ID = [0]
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_rasters.tif"
 OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output/"
-N_WORKERS = 100      # Number of CPUs to use
+N_WORKERS = 20      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 1024   # Size of the surrounding buffer
 GAP_THRESHOLD = 100  # Maximum size of gaps to close (in pixels)
@@ -49,7 +43,7 @@ MIN_AREA = 60        # Minimum size of extracted polygons (in pixels)
 # Logging setup using Rich
 # -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         RichHandler(
@@ -261,6 +255,20 @@ def get_interior(closed_lines, min_area):
     
     return interior.astype(np.uint8)
 
+def merge_vectors(input_dir, output_path):
+    input_files = [os.path.join(input_dir, file) for file in os.listdir(input_dir)]
+    
+    options = gdal.VectorTranslateOptions(
+            accessMode="overwrite",
+            makeValid=True,
+            callback=gdal.TermProgress_nocb
+        )
+    gdal.VectorTranslate(
+        output_path,   
+        srcDS=input_files,
+        options=options
+    )
+
 
 # =============================================================================
 # Driver functions
@@ -314,10 +322,10 @@ def close_gaps(block, gap_threshold):
             paired.add(i)
             paired.add(best_j)
 
-    # return result
+    return result
     
-    #* ---DEBUG---
-    return result, skeleton
+    # #* ---DEBUG---
+    # return result, skeleton
 
 def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area):
     # Get interior pixels within block & buffer
@@ -361,10 +369,10 @@ def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info
     mem_ds = None
     block_polygons = None
 
-    # return nb_polygons
+    return nb_polygons
     
-    #* ---DEBUG---
-    return nb_polygons, closed_lines, gt
+    # #* ---DEBUG---
+    # return nb_polygons, closed_lines, gt
     
 # =============================================================================
 # Extract polygons
@@ -380,16 +388,16 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
     block, block_info, raster_info = load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold)
     
     # Step 2: close gaps
-    # closed_lines = close_gaps(block, gap_threshold, lookback, ray_tolerance)
+    closed_lines = close_gaps(block, gap_threshold)
     
-    #* ---DEBUG---
-    closed_lines, skeleton = close_gaps(block, gap_threshold)
+    # # * ---DEBUG---
+    # closed_lines, skeleton = close_gaps(block, gap_threshold)
     
     # Step 3: find enclosed polygons
-    # polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
+    polygons = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
     
-    #* ---DEBUG---
-    polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
+    # #* ---DEBUG---
+    # polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
     
     if polygons == 0:
         log.debug("no enclosed polygons found")
@@ -401,36 +409,36 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
         }
         
         
-    #* ---DEBUG: write out intermediate outputs
-    block_path = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_blockinfo.fgb")
-    write_block_debug(block_info, raster_info, block_path)
+    # #* ---DEBUG: write out intermediate outputs
+    # block_path = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_blockinfo.fgb")
+    # write_block_debug(block_info, raster_info, block_path)
        
-    pre_skel = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_pre_skel.tif")
-    closed = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_closed.tif")
-    r0 = block_info.inner_row_offset
-    c0 = block_info.inner_col_offset
-    interior_skel = skeleton[r0:r0 + block_info.block_height,  # Top and bottom rows
-                              c0:c0 + block_info.block_width]   # Left and right columns
-    interior_lines = closed_lines[r0:r0 + block_info.block_height,  # Top and bottom rows
-                              c0:c0 + block_info.block_width]   # Left and right columns
+    # pre_skel = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_pre_skel.tif")
+    # closed = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_closed.tif")
+    # r0 = block_info.inner_row_offset
+    # c0 = block_info.inner_col_offset
+    # interior_skel = skeleton[r0:r0 + block_info.block_height,  # Top and bottom rows
+    #                           c0:c0 + block_info.block_width]   # Left and right columns
+    # interior_lines = closed_lines[r0:r0 + block_info.block_height,  # Top and bottom rows
+    #                           c0:c0 + block_info.block_width]   # Left and right columns
 
-    pre_skel_ds = gdal.GetDriverByName("GTiff").Create(
-        pre_skel, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
-    )
-    pre_skel_ds.SetGeoTransform(gt)
-    pre_skel_ds.SetProjection(raster_info.projection.ExportToWkt())
-    pre_skel_band = pre_skel_ds.GetRasterBand(1)
-    pre_skel_band.SetNoDataValue(0)
-    pre_skel_band.WriteArray(interior_skel)
+    # pre_skel_ds = gdal.GetDriverByName("GTiff").Create(
+    #     pre_skel, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
+    # )
+    # pre_skel_ds.SetGeoTransform(gt)
+    # pre_skel_ds.SetProjection(raster_info.projection.ExportToWkt())
+    # pre_skel_band = pre_skel_ds.GetRasterBand(1)
+    # pre_skel_band.SetNoDataValue(0)
+    # pre_skel_band.WriteArray(interior_skel)
     
-    closed_ds = gdal.GetDriverByName("GTiff").Create(
-        closed, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
-    )
-    closed_ds.SetGeoTransform(gt)
-    closed_ds.SetProjection(raster_info.projection.ExportToWkt())
-    closed_band = closed_ds.GetRasterBand(1)
-    closed_band.SetNoDataValue(0)
-    closed_band.WriteArray(interior_lines)
+    # closed_ds = gdal.GetDriverByName("GTiff").Create(
+    #     closed, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
+    # )
+    # closed_ds.SetGeoTransform(gt)
+    # closed_ds.SetProjection(raster_info.projection.ExportToWkt())
+    # closed_band = closed_ds.GetRasterBand(1)
+    # closed_band.SetNoDataValue(0)
+    # closed_band.WriteArray(interior_lines)
     
     
     return {
@@ -457,12 +465,6 @@ def main():
     ny = math.ceil(info.rows / BLOCKSIZE)
     total_blocks = nx * ny
     
-    # Create output geopackage for polygons
-    output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
-    output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
-    output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
-    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    output_layer.CreateField(fieldname)
     
     # Set up arguments for parallel processing
     worker_args = [
@@ -490,6 +492,7 @@ def main():
                 try:
                     result = future.result()
                     if result["status"] == "success":
+                        completed_blocks.append(result["output"])
                         log.info(f"{result['block_id']}: {result['status']}")
                     elif result["status"] == "null":
                         log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
@@ -502,31 +505,36 @@ def main():
 
     log.info(f"{len(completed_blocks)} blocks written successfully.")
     
-    output_vector = None
+    # # Create output geopackage for polygons
+    if os.listdir(output_block_dir):
+        log.info("Merging polygons...")
+        output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
+        merge_vectors(output_block_dir, output_vector_path)
+        
     
 if __name__ == "__main__":
-    # main()
-    output_block_dir = os.path.join(OUTPUT_DIR, "block_polygons")
-    os.makedirs(output_block_dir, exist_ok=True)
+    main()
+    # output_block_dir = os.path.join(OUTPUT_DIR, "block_polygons")
+    # os.makedirs(output_block_dir, exist_ok=True)
     
-    log.debug("Getting raster info")
+    # log.debug("Getting raster info")
     
-    info = get_raster_info(INPUT_RASTER)
-    nx = math.ceil(info.cols / BLOCKSIZE)
-    ny = math.ceil(info.rows / BLOCKSIZE)
-    total_blocks = nx * ny
+    # info = get_raster_info(INPUT_RASTER)
+    # nx = math.ceil(info.cols / BLOCKSIZE)
+    # ny = math.ceil(info.rows / BLOCKSIZE)
+    # total_blocks = nx * ny
     
-    log.debug(f"Extracting polygons for block {BLOCK_ID}")
+    # log.debug(f"Extracting polygons for block {BLOCK_ID}")
     
-    # Run function
-    args = [output_block_dir, 
-            INPUT_RASTER,
-            BLOCKSIZE,
-            BUFFER_DIST,
-            GAP_THRESHOLD,
-            PROBABILITY_THRESHOLD,
-            MIN_AREA]
-    for id in BLOCK_ID:
-        result = extract_polygons(id, *args)
-        if result["status"] == "success":
-            log.info(f"{result['block_id']}: {result['status']}")
+    # # Run function
+    # args = [output_block_dir, 
+    #         INPUT_RASTER,
+    #         BLOCKSIZE,
+    #         BUFFER_DIST,
+    #         GAP_THRESHOLD,
+    #         PROBABILITY_THRESHOLD,
+    #         MIN_AREA]
+    # for id in BLOCK_ID:
+    #     result = extract_polygons(id, *args)
+    #     if result["status"] == "success":
+    #         log.info(f"{result['block_id']}: {result['status']}")
