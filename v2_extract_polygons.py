@@ -41,8 +41,6 @@ N_WORKERS = 100      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 1024   # Size of the surrounding buffer
 GAP_THRESHOLD = 100  # Maximum size of gaps to close (in pixels)
-LOOKBACK = 20        # How many pixels to walk back along to get line direction
-RAY_TOLERANCE = 4    # Size of window for nearby pixels when closing gaps
 PROBABILITY_THRESHOLD = 10  # For linear features
 MIN_AREA = 60        # Minimum size of extracted polygons (in pixels)
 
@@ -237,38 +235,7 @@ def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_thresho
     
     return block, block_info, raster_info
 
-def get_endpoint_orientation(skeleton, ep_row, ep_col, lookback=15):
-    # Visit the pixels in the endpoint's line, find direction
-    visited = set()
-    path = [(ep_row, ep_col)]
-    visited.add((ep_row, ep_col))
-    
-    for _ in range(lookback):
-        r, c = path[-1]
-        neighbors = [
-            (r+dr, c+dc)
-            for dr in [-1,0,1] for dc in [-1,0,1]
-            if (dr,dc) != (0,0)
-            and 0 <= r+dr < skeleton.shape[0]
-            and 0 <= c+dc < skeleton.shape[1]
-            and skeleton[r+dr, c+dc] == 1
-            and (r+dr, c+dc) not in visited
-        ]
-        if not neighbors:
-            break
-        path.append(neighbors[0])
-        visited.add(neighbors[0])
-    
-    if len(path) < 2:
-        return None
-    
-    # Direction vector from last point back to endpoint
-    dr = path[0][0] - path[-1][0]
-    dc = path[0][1] - path[-1][1]
-    norm = np.hypot(dr, dc)
-    return (dr/norm, dc/norm) if norm > 0 else None
-
-def get_interior(closed_lines):
+def get_interior(closed_lines, min_area):
     # Find the pixels that are fully enclosed by lines and not lines
     background = (closed_lines == 0)
     
@@ -285,13 +252,20 @@ def get_interior(closed_lines):
     border_labels.discard(0)  # Discard lines (ndimage.label makes these 0)
     interior = np.isin(labeled_bg, list(border_labels), invert=True) & background
     
+    # Remove small enclosed regions
+    if min_area > 0:
+        labeled_interior, _ = ndimage.label(interior)
+        sizes = ndimage.sum(interior, labeled_interior, range(1, labeled_interior.max() + 1))
+        small_labels = np.where(np.array(sizes) < min_area)[0] + 1
+        interior[np.isin(labeled_interior, small_labels)] = False
+    
     return interior.astype(np.uint8)
 
 
 # =============================================================================
 # Driver functions
 # =============================================================================
-def close_gaps(block, gap_threshold, lookback, ray_tolerance):
+def close_gaps(block, gap_threshold):
     bool_arr = block.astype(bool)
     
     # Skeletonize
@@ -309,39 +283,45 @@ def close_gaps(block, gap_threshold, lookback, ray_tolerance):
     ep_coords = list(zip(*np.where(endpoints)))
     result = skeleton.copy()
     
+    if len(ep_coords) < 2:
+        return result
+
+    paired = set()  # track already-connected endpoint pairs
+
     for i, (r1, c1) in enumerate(ep_coords):
-        orient = get_endpoint_orientation(skeleton, r1, c1, lookback)
-        if orient is None:
+        if i in paired:
             continue
-        dr, dc = orient
-        
-        # Cast ray up to gap_threshold length
-        for dist in range(1, gap_threshold + 1):
-            sr = int(round(r1 + dr * dist))
-            sc = int(round(c1 + dc * dist))
-            
-            if not (0 <= sr < skeleton.shape[0] and 0 <= sc < skeleton.shape[1]):
-                break
-            
-            # Check if we've hit another skeleton pixel (but not our own line)
-            window = skeleton[
-                max(0, sr-ray_tolerance):sr+ray_tolerance+1,
-                max(0, sc-ray_tolerance):sc+ray_tolerance+1
-            ]
-            if window.any():
-                # Draw line from (r1,c1) to (sr,sc)
-                rr, cc = draw_line(r1, c1, sr, sc)
-                result[rr, cc] = 1
-                break
-    
+
+        best_dist = np.inf
+        best_j = None
+
+        for j, (r2, c2) in enumerate(ep_coords):
+            if i == j or j in paired:
+                continue
+
+            dist = np.hypot(r2 - r1, c2 - c1)
+            if dist <= gap_threshold and dist < best_dist:
+                best_dist = dist
+                best_j = j
+
+        if best_j is not None:
+            r2, c2 = ep_coords[best_j]
+            rr, cc = draw_line(int(r1), int(c1), int(r2), int(c2))
+            # Clip to array bounds just in case
+            valid = (rr >= 0) & (rr < skeleton.shape[0]) & \
+                    (cc >= 0) & (cc < skeleton.shape[1])
+            result[rr[valid], cc[valid]] = 1
+            paired.add(i)
+            paired.add(best_j)
+
     # return result
     
     #* ---DEBUG---
     return result, skeleton
 
-def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area: int):
+def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area):
     # Get interior pixels within block & buffer
-    interior_buffer = get_interior(closed_lines)
+    interior_buffer = get_interior(closed_lines, min_area)
     
     # Crop this to the block extent (removing buffer)
     r0 = block_info.inner_row_offset
@@ -366,12 +346,7 @@ def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info
     mem_band = mem_ds.GetRasterBand(1)
     mem_band.SetNoDataValue(0)
     mem_band.WriteArray(interior_block)
-    
-    # Remove small areas from raster
-    gdal.SieveFilter(
-        mem_band, None, mem_band, threshold=min_area, connectedness=8
-    )
-    
+        
     # Create blank vector dataset in memory for polygonization
     block_polygons_path = os.path.join(output_dir, f"{block_info.block_id}_polygons.fgb")
     block_polygons = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(block_polygons_path)
@@ -394,7 +369,7 @@ def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info
 # =============================================================================
 # Extract polygons
 # =============================================================================
-def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_dist, gap_threshold, lookback, ray_tolerance, prob_threshold, min_area):
+def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_dist, gap_threshold, prob_threshold, min_area):
     # Check for buffer distance/gap threshold tolerance
     if buffer_dist < gap_threshold:
         log.warning(
@@ -408,7 +383,7 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
     # closed_lines = close_gaps(block, gap_threshold, lookback, ray_tolerance)
     
     #* ---DEBUG---
-    closed_lines, skeleton = close_gaps(block, gap_threshold, lookback, ray_tolerance)
+    closed_lines, skeleton = close_gaps(block, gap_threshold)
     
     # Step 3: find enclosed polygons
     # polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
@@ -427,11 +402,11 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
         
         
     #* ---DEBUG: write out intermediate outputs
-    block_path = os.path.join(OUTPUT_DIR, "block_polygons", "blockinfo.fgb")
+    block_path = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_blockinfo.fgb")
     write_block_debug(block_info, raster_info, block_path)
        
-    pre_skel = os.path.join(OUTPUT_DIR, "block_polygons", "pre_skel.tif")
-    closed = os.path.join(OUTPUT_DIR, "block_polygons", "closed.tif")
+    pre_skel = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_pre_skel.tif")
+    closed = os.path.join(OUTPUT_DIR, "block_polygons", f"{block_info.block_id}_closed.tif")
     r0 = block_info.inner_row_offset
     c0 = block_info.inner_col_offset
     interior_skel = skeleton[r0:r0 + block_info.block_height,  # Top and bottom rows
@@ -491,7 +466,7 @@ def main():
     
     # Set up arguments for parallel processing
     worker_args = [
-        (block_id, output_block_dir, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, LOOKBACK, RAY_TOLERANCE, PROBABILITY_THRESHOLD, MIN_AREA)
+        (block_id, output_block_dir, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD, MIN_AREA)
         for block_id in range(total_blocks)
     ]
     
@@ -549,8 +524,6 @@ if __name__ == "__main__":
             BLOCKSIZE,
             BUFFER_DIST,
             GAP_THRESHOLD,
-            LOOKBACK,
-            RAY_TOLERANCE,
             PROBABILITY_THRESHOLD,
             MIN_AREA]
     for id in BLOCK_ID:
