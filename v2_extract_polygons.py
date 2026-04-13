@@ -1,7 +1,8 @@
 # Imports
 from osgeo import gdal, ogr, osr
 from scipy import ndimage
-from skimage.morphology import skeletonize, disk
+from skimage.draw import line as draw_line
+from skimage.morphology import skeletonize
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.logging import RichHandler
 from rich.console import Console
@@ -12,20 +13,38 @@ import os, logging, math
 
 # Env settings
 gdal.UseExceptions()
+gdal.ConfigurePythonLogging(logger_name="log")
 console = Console()
+
+
+"""
+# =============================================================================
+# NOTES
+# =============================================================================
+NEXT STAGE:
+- I think trying the pixel gap closing rather than vector may work better, the 
+output from the old vector script still retains sub-threshold gaps and needs 
+debugging
+- Need to remove small areas
+- Need to modify to write polygons to disk per block, instead of storing in 
+list object (gdal.VectorTranslate?)
+"""
 
 
 # =============================================================================
 # GLOBALS
 # =============================================================================
-BLOCK_ID = [0, 1]
+BLOCK_ID = [0]
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_rasters.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output/v2"
-N_WORKERS = 100
-BLOCKSIZE = 2048
-BUFFER_DIST = 1024
-GAP_THRESHOLD = 100
-PROBABILITY_THRESHOLD = 10
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_output/"
+N_WORKERS = 100      # Number of CPUs to use
+BLOCKSIZE = 2048     # Size of the block
+BUFFER_DIST = 1024   # Size of the surrounding buffer
+GAP_THRESHOLD = 100  # Maximum size of gaps to close (in pixels)
+LOOKBACK = 20        # How many pixels to walk back along to get line direction
+RAY_TOLERANCE = 4    # Size of window for nearby pixels when closing gaps
+PROBABILITY_THRESHOLD = 10  # For linear features
+MIN_AREA = 60        # Minimum size of extracted polygons (in pixels)
 
 
 # -----------------------------------------------------------------------------
@@ -98,6 +117,46 @@ class RasterInfo():
 # =============================================================================
 # Utility functions
 # =============================================================================
+
+#* ---DEBUG---
+def write_block_debug(block_info, raster_info, output_path):
+    gt = raster_info.transform
+    
+    def pixel_to_geo(col, row):
+        x = gt[0] + col * gt[1]
+        y = gt[3] + row * gt[5]
+        return x, y
+    
+    def make_box(col, row, width, height):
+        x_min, y_max = pixel_to_geo(col, row)
+        x_max, y_min = pixel_to_geo(col + width, row + height)
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        ring.AddPoint(x_min, y_max)
+        ring.AddPoint(x_max, y_max)
+        ring.AddPoint(x_max, y_min)
+        ring.AddPoint(x_min, y_min)
+        ring.AddPoint(x_min, y_max)
+        poly = ogr.Geometry(ogr.wkbPolygon)
+        poly.AddGeometry(ring)
+        return poly
+
+    driver = ogr.GetDriverByName("FlatGeobuf")
+    ds = driver.CreateDataSource(output_path)
+    layer = ds.CreateLayer("blocks", srs=raster_info.projection, geom_type=ogr.wkbUnknown)
+    layer.CreateField(ogr.FieldDefn("label", ogr.OFTString))
+
+    for label, col, row, width, height in [
+        ("block",  block_info.block_col, block_info.block_row, block_info.block_width,  block_info.block_height),
+        ("buffer", block_info.buf_col,   block_info.buf_row,   block_info.buf_width,    block_info.buf_height),
+    ]:
+        feat = ogr.Feature(layer.GetLayerDefn())
+        feat.SetField("label", label)
+        feat.SetGeometry(make_box(col, row, width, height))
+        layer.CreateFeature(feat)
+
+    ds = None
+    
+    
 def get_raster_info(raster_path):
     ds = gdal.Open(raster_path)
     info = RasterInfo(
@@ -178,6 +237,37 @@ def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_thresho
     
     return block, block_info, raster_info
 
+def get_endpoint_orientation(skeleton, ep_row, ep_col, lookback=15):
+    # Visit the pixels in the endpoint's line, find direction
+    visited = set()
+    path = [(ep_row, ep_col)]
+    visited.add((ep_row, ep_col))
+    
+    for _ in range(lookback):
+        r, c = path[-1]
+        neighbors = [
+            (r+dr, c+dc)
+            for dr in [-1,0,1] for dc in [-1,0,1]
+            if (dr,dc) != (0,0)
+            and 0 <= r+dr < skeleton.shape[0]
+            and 0 <= c+dc < skeleton.shape[1]
+            and skeleton[r+dr, c+dc] == 1
+            and (r+dr, c+dc) not in visited
+        ]
+        if not neighbors:
+            break
+        path.append(neighbors[0])
+        visited.add(neighbors[0])
+    
+    if len(path) < 2:
+        return None
+    
+    # Direction vector from last point back to endpoint
+    dr = path[0][0] - path[-1][0]
+    dc = path[0][1] - path[-1][1]
+    norm = np.hypot(dr, dc)
+    return (dr/norm, dc/norm) if norm > 0 else None
+
 def get_interior(closed_lines):
     # Find the pixels that are fully enclosed by lines and not lines
     background = (closed_lines == 0)
@@ -201,21 +291,55 @@ def get_interior(closed_lines):
 # =============================================================================
 # Driver functions
 # =============================================================================
-def close_gaps(block, gap_threshold):
+def close_gaps(block, gap_threshold, lookback, ray_tolerance):
     bool_arr = block.astype(bool)
     
-    # Use morphological closing to remove gaps
-    closed = ndimage.binary_closing(bool_arr, structure=disk(gap_threshold))
-    
     # Skeletonize
-    closed = skeletonize(closed)
+    skeleton = skeletonize(bool_arr).astype(np.uint8)
     
-    if not closed.any():
-        log.debug("skeletonize failed, closed array is empty")
-    
-    return closed.astype(np.uint8)
+    if not skeleton.any():
+        log.debug("skeletonize failed, thresholded array is empty")
 
-def find_enclosed_polygons(closed_lines: np.ndarray, block_info: BlockInfo, raster_info: RasterInfo):
+    # Find endpoints
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    neighbor_count = ndimage.convolve(skeleton, kernel, mode='constant', cval=0)
+    endpoints = (skeleton == 1) & (neighbor_count == 2) # Count: itself & neighbor
+
+    # Close the gaps
+    ep_coords = list(zip(*np.where(endpoints)))
+    result = skeleton.copy()
+    
+    for i, (r1, c1) in enumerate(ep_coords):
+        orient = get_endpoint_orientation(skeleton, r1, c1, lookback)
+        if orient is None:
+            continue
+        dr, dc = orient
+        
+        # Cast ray up to gap_threshold length
+        for dist in range(1, gap_threshold + 1):
+            sr = int(round(r1 + dr * dist))
+            sc = int(round(c1 + dc * dist))
+            
+            if not (0 <= sr < skeleton.shape[0] and 0 <= sc < skeleton.shape[1]):
+                break
+            
+            # Check if we've hit another skeleton pixel (but not our own line)
+            window = skeleton[
+                max(0, sr-ray_tolerance):sr+ray_tolerance+1,
+                max(0, sc-ray_tolerance):sc+ray_tolerance+1
+            ]
+            if window.any():
+                # Draw line from (r1,c1) to (sr,sc)
+                rr, cc = draw_line(r1, c1, sr, sc)
+                result[rr, cc] = 1
+                break
+    
+    # return result
+    
+    #* ---DEBUG---
+    return result, skeleton
+
+def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area: int):
     # Get interior pixels within block & buffer
     interior_buffer = get_interior(closed_lines)
     
@@ -226,62 +350,51 @@ def find_enclosed_polygons(closed_lines: np.ndarray, block_info: BlockInfo, rast
                               c0:c0 + block_info.block_width]   # Left and right columns
     
     if interior_block.max() == 0:
+        log.debug("test1 no enclosed polygons")
         return 0
     
-    # Create a blank raster dataset in memory for polygonization
+    # Create raster dataset in memory for polygonization, 
     gt = list(raster_info.transform)
     gt[0] = raster_info.xmin + block_info.block_col * raster_info.pixel_width  # x origin
     gt[3] = raster_info.ymax + block_info.block_row * raster_info.pixel_height # y origin
-        
+    
     mem_ds = gdal.GetDriverByName("MEM").Create(
         "", block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
     )
     mem_ds.SetGeoTransform(gt)
     mem_ds.SetProjection(raster_info.projection.ExportToWkt())
-    
     mem_band = mem_ds.GetRasterBand(1)
     mem_band.SetNoDataValue(0)
-
-    # ---DEBUG: create tiffs for closed lines
-    output_lines = os.path.join(OUTPUT_DIR, f"lines_{block_info.block_id}.tif")
-    interior_lines = closed_lines[r0:r0 + block_info.block_height,  # Top and bottom rows
-                                     c0:c0 + block_info.block_width]   # Left and right columns
-
-    output_lines_ds = gdal.GetDriverByName("GTiff").Create(
-        output_lines, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
-    )
-    output_lines_ds.SetGeoTransform(gt)
-    output_lines_ds.SetProjection(raster_info.projection.ExportToWkt())
+    mem_band.WriteArray(interior_block)
     
-    output_lines_band = output_lines_ds.GetRasterBand(1)
-    output_lines_band.SetNoDataValue(0)
-    output_lines_band.WriteArray(interior_lines)
-    output_lines_ds = None
+    # Remove small areas from raster
+    gdal.SieveFilter(
+        mem_band, None, mem_band, threshold=min_area, connectedness=8
+    )
     
     # Create blank vector dataset in memory for polygonization
-    temp_vector = ogr.GetDriverByName("Memory").CreateDataSource("")
-    temp_layer = temp_vector.CreateLayer("enclosed_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon)
+    block_polygons_path = os.path.join(output_dir, f"{block_info.block_id}_polygons.fgb")
+    block_polygons = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(block_polygons_path)
+    polygons_layer = block_polygons.CreateLayer("enclosed_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon)
     fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    temp_layer.CreateField(fieldname)
+    polygons_layer.CreateField(fieldname)
     
     # Polygonize
-    mem_band.WriteArray(interior_block)
-    gdal.Polygonize(mem_band, mem_band, temp_layer, 0, [], callback=None)
-    polygons = []
-    for feat in temp_layer:
-        geom = feat.GetGeometryRef()
-        if geom:
-            polygons.append((block_info.block_id, geom.ExportToWkt()))
-            
+    gdal.Polygonize(mem_band, mem_band, polygons_layer, 0, [], callback=None)
+    nb_polygons = len(polygons_layer)
+
     mem_ds = None
-    temp_vector = None
+    block_polygons = None
+
+    # return nb_polygons
     
-    return polygons
+    #* ---DEBUG---
+    return nb_polygons, closed_lines, gt
     
 # =============================================================================
 # Extract polygons
 # =============================================================================
-def extract_polygons(block_id, input_raster_path, blocksize, buffer_dist, gap_threshold, prob_threshold):
+def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_dist, gap_threshold, lookback, ray_tolerance, prob_threshold, min_area):
     # Check for buffer distance/gap threshold tolerance
     if buffer_dist < gap_threshold:
         log.warning(
@@ -292,23 +405,63 @@ def extract_polygons(block_id, input_raster_path, blocksize, buffer_dist, gap_th
     block, block_info, raster_info = load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold)
     
     # Step 2: close gaps
-    closed_lines = close_gaps(block, gap_threshold)
+    # closed_lines = close_gaps(block, gap_threshold, lookback, ray_tolerance)
+    
+    #* ---DEBUG---
+    closed_lines, skeleton = close_gaps(block, gap_threshold, lookback, ray_tolerance)
     
     # Step 3: find enclosed polygons
-    polygons = find_enclosed_polygons(closed_lines, block_info, raster_info)
+    # polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
+    
+    #* ---DEBUG---
+    polygons, closed_lines, gt = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
+    
     if polygons == 0:
         log.debug("no enclosed polygons found")
         return {
             "block_id": block_id,
             "status": "null",
             "polygon_count": 0,
-            "polygons": []
+            "polygons": polygons
         }
+        
+        
+    #* ---DEBUG: write out intermediate outputs
+    block_path = os.path.join(OUTPUT_DIR, "block_polygons", "blockinfo.fgb")
+    write_block_debug(block_info, raster_info, block_path)
+       
+    pre_skel = os.path.join(OUTPUT_DIR, "block_polygons", "pre_skel.tif")
+    closed = os.path.join(OUTPUT_DIR, "block_polygons", "closed.tif")
+    r0 = block_info.inner_row_offset
+    c0 = block_info.inner_col_offset
+    interior_skel = skeleton[r0:r0 + block_info.block_height,  # Top and bottom rows
+                              c0:c0 + block_info.block_width]   # Left and right columns
+    interior_lines = closed_lines[r0:r0 + block_info.block_height,  # Top and bottom rows
+                              c0:c0 + block_info.block_width]   # Left and right columns
+
+    pre_skel_ds = gdal.GetDriverByName("GTiff").Create(
+        pre_skel, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
+    )
+    pre_skel_ds.SetGeoTransform(gt)
+    pre_skel_ds.SetProjection(raster_info.projection.ExportToWkt())
+    pre_skel_band = pre_skel_ds.GetRasterBand(1)
+    pre_skel_band.SetNoDataValue(0)
+    pre_skel_band.WriteArray(interior_skel)
+    
+    closed_ds = gdal.GetDriverByName("GTiff").Create(
+        closed, block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
+    )
+    closed_ds.SetGeoTransform(gt)
+    closed_ds.SetProjection(raster_info.projection.ExportToWkt())
+    closed_band = closed_ds.GetRasterBand(1)
+    closed_band.SetNoDataValue(0)
+    closed_band.WriteArray(interior_lines)
+    
     
     return {
         "block_id": block_id,
         "status": "success",
-        "polygon_count": len(polygons),
+        "polygon_count": polygons,
         "polygons": polygons
     }
     
@@ -317,8 +470,9 @@ def extract_polygons(block_id, input_raster_path, blocksize, buffer_dist, gap_th
 # MAIN
 # =============================================================================
 def main():
-    # Make output folder
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Make output folders
+    output_block_dir = os.path.join(OUTPUT_DIR, "block_polygons")
+    os.makedirs(output_block_dir, exist_ok=True)
     
     # Open raster dataset and get number of blocks
     log.debug("Getting raster info")
@@ -337,7 +491,7 @@ def main():
     
     # Set up arguments for parallel processing
     worker_args = [
-        (block_id, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD)
+        (block_id, output_block_dir, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, LOOKBACK, RAY_TOLERANCE, PROBABILITY_THRESHOLD, MIN_AREA)
         for block_id in range(total_blocks)
     ]
     
@@ -361,7 +515,6 @@ def main():
                 try:
                     result = future.result()
                     if result["status"] == "success":
-                        completed_blocks.append(result["block_id"])
                         log.info(f"{result['block_id']}: {result['status']}")
                     elif result["status"] == "null":
                         log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
@@ -378,45 +531,29 @@ def main():
     
 if __name__ == "__main__":
     # main()
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_block_dir = os.path.join(OUTPUT_DIR, "block_polygons")
+    os.makedirs(output_block_dir, exist_ok=True)
     
     log.debug("Getting raster info")
     
     info = get_raster_info(INPUT_RASTER)
+    nx = math.ceil(info.cols / BLOCKSIZE)
+    ny = math.ceil(info.rows / BLOCKSIZE)
+    total_blocks = nx * ny
     
     log.debug(f"Extracting polygons for block {BLOCK_ID}")
     
-    polygons = []
+    # Run function
+    args = [output_block_dir, 
+            INPUT_RASTER,
+            BLOCKSIZE,
+            BUFFER_DIST,
+            GAP_THRESHOLD,
+            LOOKBACK,
+            RAY_TOLERANCE,
+            PROBABILITY_THRESHOLD,
+            MIN_AREA]
     for id in BLOCK_ID:
-        result = extract_polygons(id, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD)
-        polygons.extend(result["polygons"])
-
-    output_vector_path = os.path.join(OUTPUT_DIR, "polygons.gpkg")
-    output_vector = ogr.GetDriverByName("GPKG").CreateDataSource(output_vector_path)
-    output_layer = output_vector.CreateLayer("enclosed_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
-    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    output_layer.CreateField(fieldname)
-    
-    if len(polygons) > 0:
-        with Progress(
-            SpinnerColumn(),
-            "[progress.description]{task.description}",
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-
-            task = progress.add_task("Writing polygons...", total=len(polygons))
-            
-            # for b_id, wkt_geom in result["polygons"]:
-            for b_id, wkt_geom in polygons:
-                feat = ogr.Feature(output_layer.GetLayerDefn())
-                feat.SetField("block_id", b_id)
-                feat.SetGeometry(ogr.CreateGeometryFromWkt(wkt_geom, info.projection))
-                output_layer.CreateFeature(feat)
-                feat = None
-
-                progress.update(task, advance=1)
-            
-    output_vector = None
+        result = extract_polygons(id, *args)
+        if result["status"] == "success":
+            log.info(f"{result['block_id']}: {result['status']}")
