@@ -4,12 +4,11 @@ from scipy import ndimage
 from skimage.draw import line as draw_line
 from skimage.morphology import skeletonize
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from rich.logging import RichHandler
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
 from dataclasses import dataclass, field
 import numpy as np
-import os, logging, math
+import os, logging, math, shutil
 
 # Env settings
 gdal.UseExceptions()
@@ -27,9 +26,9 @@ NEXT STAGE:
 # =============================================================================
 # GLOBALS
 # =============================================================================
-INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/Linear_features_raster/lines_v03.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/all_patagonia/"
-N_WORKERS = 180      # Number of CPUs to use
+INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_tile.tif"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_tile"
+N_WORKERS = 1      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 1024   # Size of the surrounding buffer
 GAP_THRESHOLD = 80   # Maximum size of gaps to close (in pixels)
@@ -206,21 +205,24 @@ def get_interior(closed_lines, min_area):
     
     return interior.astype(np.uint8)
 
-def merge_vectors(input_dir, output_path):
-    input_files = [os.path.join(input_dir, file) for file in os.listdir(input_dir)]
-    out_ds = ogr.GetDriverByName("GPKG").CreateDataSource(output_path)
-    out_layer = out_ds.CreateLayer("merged_polygons", geom_type=ogr.wkbPolygon)
+def merge_vectors(input_dir, output_path, info, progress, task):
+    out_ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(output_path)
+    out_layer = out_ds.CreateLayer("merged_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
 
-    for file in input_files:
+    for file in os.listdir(input_dir):
         if file.endswith(".fgb"):
-            ds = ogr.Open(file)
+            filepath = os.path.join(input_dir, file)
+            ds = ogr.Open(filepath)
             lyr = ds.GetLayer()
             for feat in lyr:
                 out_feat = ogr.Feature(out_layer.GetLayerDefn())
                 out_feat.SetGeometry(feat.GetGeometryRef().Clone())
                 out_layer.CreateFeature(out_feat)
-                out_layer.SyncToDisk()
                 out_feat = None
+            
+            ds = None
+
+        progress.update(task, advance=1)
     
     out_ds = None
 
@@ -425,26 +427,12 @@ def main():
             task = progress.add_task("Merging polygons...", total=len(total_to_merge))
 
             output_vector_path = os.path.join(OUTPUT_DIR, "polygons.fgb")
-            input_files = [os.path.join(output_block_dir, file) for file in os.listdir(output_block_dir)]
-            out_ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(output_vector_path)
-            out_layer = out_ds.CreateLayer("merged_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
-
-            for file in input_files:
-                if file.endswith(".fgb"):
-                    ds = ogr.Open(file)
-                    lyr = ds.GetLayer()
-                    for feat in lyr:
-                        out_feat = ogr.Feature(out_layer.GetLayerDefn())
-                        out_feat.SetGeometry(feat.GetGeometryRef().Clone())
-                        out_layer.CreateFeature(out_feat)
-                        out_layer.SyncToDisk()
-                        out_feat = None
-                    
-                    ds = None
-
-                progress.update(task, advance=1)
-            
-            out_ds = None
+            merge_vectors(output_block_dir, output_vector_path, info, progress, task)
+        
+        # Remove block polygons folder
+        shutil.rmtree(output_block_dir)
+    
+    console.print("All polygons merged")
             
     
 if __name__ == "__main__":
