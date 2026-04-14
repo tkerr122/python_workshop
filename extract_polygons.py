@@ -1,751 +1,451 @@
 # Imports
-from osgeo import gdal, osr
+from osgeo import gdal, ogr, osr
 from scipy import ndimage
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
+from skimage.draw import line as draw_line
+from skimage.morphology import skeletonize
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from rich.logging import RichHandler
 from rich.console import Console
-import geopandas as gpd
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
+from dataclasses import dataclass, field
 import numpy as np
-import shapely, skimage, fiona, os, argparse, tempfile, gc, shutil, sys
+import os, logging, math
 
 # Env settings
 gdal.UseExceptions()
-TILE_SIZE = 4096
-BATCH_SIZE = 10000
+gdal.ConfigurePythonLogging(logger_name="log")
+console = Console()
 
 """
-I have written this script to be a command-line utility for extracting areas
-enclosed by linear features.
-===============================================================================
--p option: path to linear features input raster
--od option: output directory
--sk option: whether or not to write out skeleton raster
--t option: probability threshold of line features. Defaults to 50.
--cr option: pixels to consider for initial gap bridging
--ma option: minimum component size (in pixels) to retain
--gt option: gap tolerance for closing gaps (in meters)
--at option: angle tolerance for closing gaps
--max option: maximum area for extracted plots
+# =============================================================================
+# NOTES
+# =============================================================================
+NEXT STAGE:
+- Need to figure out how to merge the flatgeobufs at the end
 """
-# Helper function 1: Calculate bearing
-def _endpoint_bearing(line, at_start: bool, lookback: int = 5) -> float:
-    coords = list(line.coords)
-    lookback = min(lookback, len(coords) - 1)
-    if at_start:
-        p1, p2 = coords[lookback], coords[0]
-    else:
-        p1, p2 = coords[-(lookback + 1)], coords[-1]
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    return np.degrees(np.arctan2(dx, dy)) % 360
 
-# Helper function 2: read gpkg in chunks
-def _read_gpkg_chunks(path, chunksize, crs):
-    with fiona.open(path) as src:
-        chunk = []
-        for feature in src:
-            chunk.append(feature)
-            if len(chunk) >= chunksize:
-                yield gpd.GeoDataFrame.from_features(chunk, crs=crs)
-                chunk = []
-        if chunk:
-            yield gpd.GeoDataFrame.from_features(chunk, crs=crs)
+# =============================================================================
+# GLOBALS
+# =============================================================================
+INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/Linear_features_raster/lines_v03.tif"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/all_patagonia/"
+N_WORKERS = 180      # Number of CPUs to use
+BLOCKSIZE = 2048     # Size of the block
+BUFFER_DIST = 1024   # Size of the surrounding buffer
+GAP_THRESHOLD = 80   # Maximum size of gaps to close (in pixels)
+PROBABILITY_THRESHOLD = 15  # For linear features
+MIN_AREA = 80        # Minimum size of extracted polygons (in pixels)
 
-# Stage 1: Load the linear features
-def load_linear_features(console: Console, tmp_dir: str, linear_features_path: str, threshold: int = 50) -> tuple:
-    """
-    Loads in a raster of linear features with pixel values from 0-100
-    probability. Keeps pixels above the threshold and writes a thresholded
-    binary raster to a temporary file.
+# -----------------------------------------------------------------------------
+# Logging setup using Rich
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "log_polygon_extractor.log"),
+            mode="w"
+        )
+    ]
+)
+log = logging.getLogger(__name__)
 
-    Args:
-        console (Console): rich Console object.
-        linear_features_path (str): path to linear features raster.
-        threshold (int, optional): threshold value for masking.
-        Defaults to 50.
+# =============================================================================
+# Custom classes
+# =============================================================================
+@dataclass
+class BlockInfo():
+    # Block's id
+    block_id: int 
+    # True block (what the buffer is built around)
+    block_col: int          # x offset of the block
+    block_row: int          # y offset of the block
+    block_width: int        # pixel columns in the block
+    block_height: int       # pixel rows in the block
+    
+    # Buffered region: what we actually read from disk
+    buf_col: int            # x offset of the buffered read
+    buf_row: int            # y offset of the buffered read
+    buf_width: int          # pixel columns actually read
+    buf_height: int         # pixel rows actually read
 
-    Returns:
-        tuple: path to thresholded raster, geotransform, projection,
-        xsize, ysize.
-    """
-    linear_features = gdal.Open(linear_features_path)
-    xsize = linear_features.RasterXSize
-    ysize = linear_features.RasterYSize
-    transform = linear_features.GetGeoTransform()
-    projection = linear_features.GetSpatialRef()
-    band = linear_features.GetRasterBand(1)
+    # How far the true block is from the buffered origin
+    inner_col_offset: int   # = block_col - buf_col
+    inner_row_offset: int   # = block_row - buf_row
+    
+@dataclass
+class RasterInfo():
+    cols: int
+    rows: int
+    transform: tuple
+    projection: osr.SpatialReference
+    
+    # Derived fields - excluded from __init__
+    xmin: float = field(init=False)
+    xmax: float = field(init=False)
+    ymin: float = field(init=False)
+    ymax: float = field(init=False)
+    pixel_width: float = field(init=False)
+    pixel_height: float = field(init=False)
+    
+    def __post_init__(self):
+        self.xmin        = self.transform[0]
+        self.ymax        = self.transform[3]
+        self.pixel_width = self.transform[1]
+        self.pixel_height= self.transform[5]
+        self.xmax        = self.xmin + self.pixel_width * self.cols
+        self.ymin        = self.ymax + self.pixel_height * self.rows
 
-    # Create a temporary output raster
-    thresholded_path = os.path.join(tmp_dir, "thresholded.tif")
-    driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(
-        thresholded_path, xsize, ysize, 1, gdal.GDT_Byte,
-        options=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"]
+# =============================================================================
+# Utility functions
+# =============================================================================    
+def get_raster_info(raster_path):
+    ds = gdal.Open(raster_path)
+    info = RasterInfo(
+        cols=ds.RasterXSize,
+        rows=ds.RasterYSize,
+        transform=ds.GetGeoTransform(),
+        projection=ds.GetSpatialRef()
     )
-    out_ds.SetGeoTransform(transform)
-    out_ds.SetProjection(projection.ExportToWkt())
-    out_band = out_ds.GetRasterBand(1)
-    out_band.SetNoDataValue(255)
+    ds = None
+    
+    return info
+    
+def get_block_info(block_id, raster_info, blocksize, buffer):
+    n_blocks_x = math.ceil(raster_info.cols  / blocksize)
+    n_blocks_y = math.ceil(raster_info.rows / blocksize)
+    block_row_idx = block_id // n_blocks_x
+    block_col_idx = block_id  % n_blocks_x
 
-    n_tiles_x = (xsize + TILE_SIZE - 1) // TILE_SIZE
-    n_tiles_y = (ysize + TILE_SIZE - 1) // TILE_SIZE
-    total_tiles = n_tiles_x * n_tiles_y
+    if block_row_idx >= n_blocks_y:
+        raise ValueError(f"block_id {block_id} exceeds raster extent.")
+    
+    # Get true block extents (some blocks on the edge may be smaller than blocksize)
+    block_col = block_col_idx * blocksize
+    block_row = block_row_idx * blocksize
+    block_width = min(blocksize, raster_info.cols - block_col)
+    block_height = min(blocksize, raster_info.rows - block_row)
+    
+    # Get buffer extents, clamped to raster dimensions
+    buf_col = max(0, block_col - buffer)
+    buf_row = max(0, block_row - buffer)
+    buf_right = min(raster_info.cols, block_col + block_width + buffer)
+    buf_bottom = min(raster_info.rows, block_row + block_height + buffer)
+    buf_width = buf_right  - buf_col
+    buf_height = buf_bottom - buf_row
 
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-        task = progress.add_task("Loading and thresholding...", total=total_tiles)
+    # Get offset of the true block inside the buffered array
+    inner_col_offset = block_col - buf_col
+    inner_row_offset = block_row - buf_row
 
-        for y in range(0, ysize, TILE_SIZE):
-            for x in range(0, xsize, TILE_SIZE):
-                win_xsize = min(TILE_SIZE, xsize - x)
-                win_ysize = min(TILE_SIZE, ysize - y)
+    return BlockInfo(
+        block_id=block_id,
+        block_col=block_col,
+        block_row=block_row,
+        block_width=block_width,
+        block_height=block_height,
+        buf_col=buf_col,
+        buf_row=buf_row,
+        buf_width=buf_width,
+        buf_height=buf_height,
+        inner_col_offset=inner_col_offset,
+        inner_row_offset=inner_row_offset,
+    )
 
-                tile = band.ReadAsArray(x, y, win_xsize, win_ysize).astype(np.uint8)
-                thresholded = np.where(tile > threshold, 1, 0).astype(np.uint8)
-                out_band.WriteArray(thresholded, x, y)
+def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold):
+    # Get raster info
+    raster_info = get_raster_info(input_raster_path)
+    
+    # Get block info
+    block_info = get_block_info(block_id, raster_info, blocksize, buffer_dist)
+    
+    # Read in block
+    ds = gdal.Open(input_raster_path, gdal.GA_ReadOnly)
+    band = ds.GetRasterBand(1)
+    block = band.ReadAsArray(
+        block_info.buf_col,    # xoff
+        block_info.buf_row,    # yoff
+        block_info.buf_width,  # xsize
+        block_info.buf_height  # ysize
+    )
+    
+    ds = None
+    
+    # Convert to mask
+    block = (block > prob_threshold).astype(np.uint8)
+    
+    if not block.any():
+        log.debug("Block load failed, block array is empty")
+    
+    return block, block_info, raster_info
 
-                progress.update(task, advance=1)
+def get_interior(closed_lines, min_area):
+    # Find the pixels that are fully enclosed by lines and not lines
+    background = (closed_lines == 0)
+    
+    if not background.any():
+        log.debug("Getting background failed, empty array")
+        
+    labeled_bg, _ = ndimage.label(background)
+    border_labels = set()
+    
+    for edge in (labeled_bg[0, :], labeled_bg[-1, :],  # Top and bottom rows
+                 labeled_bg[:, 0], labeled_bg[:, -1]): # Left and right columns
+        border_labels.update(edge.flat)
+    
+    border_labels.discard(0)  # Discard lines (ndimage.label makes these 0)
+    interior = np.isin(labeled_bg, list(border_labels), invert=True) & background
+    
+    # Remove small enclosed regions
+    if min_area > 0:
+        labeled_interior, _ = ndimage.label(interior)
+        sizes = ndimage.sum(interior, labeled_interior, range(1, labeled_interior.max() + 1))
+        small_labels = np.where(np.array(sizes) < min_area)[0] + 1
+        interior[np.isin(labeled_interior, small_labels)] = False
+    
+    return interior.astype(np.uint8)
 
-    out_band.FlushCache()
+def merge_vectors(input_dir, output_path):
+    input_files = [os.path.join(input_dir, file) for file in os.listdir(input_dir)]
+    out_ds = ogr.GetDriverByName("GPKG").CreateDataSource(output_path)
+    out_layer = out_ds.CreateLayer("merged_polygons", geom_type=ogr.wkbPolygon)
+
+    for file in input_files:
+        if file.endswith(".fgb"):
+            ds = ogr.Open(file)
+            lyr = ds.GetLayer()
+            for feat in lyr:
+                out_feat = ogr.Feature(out_layer.GetLayerDefn())
+                out_feat.SetGeometry(feat.GetGeometryRef().Clone())
+                out_layer.CreateFeature(out_feat)
+                out_layer.SyncToDisk()
+                out_feat = None
+    
     out_ds = None
-    linear_features = None
 
-    console.print("\u2713 Loaded and thresholded linear features", style="dim green")
+# =============================================================================
+# Driver functions
+# =============================================================================
+def close_gaps(block, gap_threshold):
+    bool_arr = block.astype(bool)
     
-    return thresholded_path, transform, projection, xsize, ysize
+    # Skeletonize
+    skeleton = skeletonize(bool_arr).astype(np.uint8)
+    
+    if not skeleton.any():
+        log.debug("skeletonize failed, thresholded array is empty")
 
+    # Find endpoints
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    neighbor_count = ndimage.convolve(skeleton, kernel, mode='constant', cval=0)
+    endpoints = (skeleton == 1) & (neighbor_count == 2) # Count: itself & neighbor
 
-# Stage 2: Morphological cleaning
-def morphological_clean(console: Console, tmp_dir: str, thresholded_path: str, transform: tuple, projection: osr.SpatialReference, xsize: int, ysize: int, closing_radius: int = 2, min_area: int = 50) -> str:
-    """
-    Uses scipy's ndimage to bridge pixel gaps up to the closing radius
-    value, then uses gdal.SieveFilter to remove small areas. Reads and
-    writes in tiles to minimise memory usage.
+    # Close the gaps
+    ep_coords = list(zip(*np.where(endpoints)))
+    result = skeleton.copy()
+    
+    if len(ep_coords) < 2:
+        return result
 
-    Args:
-        console (Console): rich Console object.
-        thresholded_path (str): path to thresholded raster from Stage 1.
-        transform (tuple): geotransform of the original raster.
-        projection (osr.SpatialReference): projection of the original raster.
-        xsize (int): raster width in pixels.
-        ysize (int): raster height in pixels.
-        closing_radius (int, optional): pixels to consider for gap bridging.
-        Defaults to 2.
-        min_area (int, optional): component size in pixels to retain.
-        Defaults to 50.
+    paired = set()  # track already-connected endpoint pairs
 
-    Returns:
-        str: path to cleaned raster.
-    """
-    overlap = closing_radius + 1
+    for i, (r1, c1) in enumerate(ep_coords):
+        if i in paired:
+            continue
 
-    in_ds = gdal.Open(thresholded_path)
-    in_band = in_ds.GetRasterBand(1)
+        best_dist = np.inf
+        best_j = None
 
-    cleaned_path = os.path.join(tmp_dir, "cleaned.tif")
-    driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(
-        cleaned_path, xsize, ysize, 1, gdal.GDT_Byte,
-        options=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"]
+        for j, (r2, c2) in enumerate(ep_coords):
+            if i == j or j in paired:
+                continue
+
+            dist = np.hypot(r2 - r1, c2 - c1)
+            if dist <= gap_threshold and dist < best_dist:
+                best_dist = dist
+                best_j = j
+
+        if best_j is not None:
+            r2, c2 = ep_coords[best_j]
+            rr, cc = draw_line(int(r1), int(c1), int(r2), int(c2))
+            # Clip to array bounds just in case
+            valid = (rr >= 0) & (rr < skeleton.shape[0]) & \
+                    (cc >= 0) & (cc < skeleton.shape[1])
+            result[rr[valid], cc[valid]] = 1
+            paired.add(i)
+            paired.add(best_j)
+
+    return result
+
+def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area):
+    # Get interior pixels within block & buffer
+    interior_buffer = get_interior(closed_lines, min_area)
+    
+    # Crop this to the block extent (removing buffer)
+    r0 = block_info.inner_row_offset
+    c0 = block_info.inner_col_offset
+    interior_block = interior_buffer[r0:r0 + block_info.block_height,  # Top and bottom rows
+                              c0:c0 + block_info.block_width]   # Left and right columns
+    
+    if interior_block.max() == 0:
+        log.debug("test1 no enclosed polygons")
+        return 0
+    
+    # Create raster dataset in memory for polygonization, 
+    gt = list(raster_info.transform)
+    gt[0] = raster_info.xmin + block_info.block_col * raster_info.pixel_width  # x origin
+    gt[3] = raster_info.ymax + block_info.block_row * raster_info.pixel_height # y origin
+    
+    mem_ds = gdal.GetDriverByName("MEM").Create(
+        "", block_info.block_width, block_info.block_height, 1, gdal.GDT_Byte
     )
-    out_ds.SetGeoTransform(transform)
-    out_ds.SetProjection(projection.ExportToWkt())
-    out_band = out_ds.GetRasterBand(1)
-    out_band.SetNoDataValue(255)
-
-    structure = ndimage.generate_binary_structure(2, 1)
-    structure = ndimage.iterate_structure(structure, closing_radius)
-
-    n_tiles_x = (xsize + TILE_SIZE - 1) // TILE_SIZE
-    n_tiles_y = (ysize + TILE_SIZE - 1) // TILE_SIZE
-    total_tiles = n_tiles_x * n_tiles_y
-
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-        task = progress.add_task("Closing gaps...", total=total_tiles)
-
-        for y in range(0, ysize, TILE_SIZE):
-            for x in range(0, xsize, TILE_SIZE):
-                win_xsize = min(TILE_SIZE, xsize - x)
-                win_ysize = min(TILE_SIZE, ysize - y)
-
-                # Read tile with overlap to avoid edge effects
-                x_start = max(0, x - overlap)
-                y_start = max(0, y - overlap)
-                x_end = min(xsize, x + win_xsize + overlap)
-                y_end = min(ysize, y + win_ysize + overlap)
-
-                tile = in_band.ReadAsArray(x_start, y_start, x_end - x_start, y_end - y_start)
-                closed = ndimage.binary_closing(tile, structure=structure).astype(np.uint8)
-
-                # Write only the non-overlapping center region
-                cx = x - x_start
-                cy = y - y_start
-                out_band.WriteArray(closed[cy:cy + win_ysize, cx:cx + win_xsize], x, y)
-
-                progress.update(task, advance=1)
-
-        out_band.FlushCache()
-        out_ds = None
-        in_ds = None
-
-        # Run sieve filter in place on the closed raster
-        progress.update(task, description="Removing small areas...", total=None, completed=0)
-        sieve_ds = gdal.Open(cleaned_path, gdal.GA_Update)
-        gdal.SieveFilter(
-            sieve_ds.GetRasterBand(1),
-            None,
-            sieve_ds.GetRasterBand(1),
-            threshold=min_area,
-            connectedness=8
-        )
-        sieve_ds = None
-
-    console.print("\u2713 Removed single pixel gaps and small areas", style="dim green")
-    
-    return cleaned_path
-
-# Stage 3: Skeletonize
-def skeletonize(console, cleaned_path: str, transform: tuple, projection: osr.SpatialReference, xsize: int, ysize: int, output_dir: str = None, rasterize: bool = False) -> str:
-    """
-    Uses skimage's skeletonize function on the cleaned raster and writes
-    the single-pixel-wide centerlines to a temporary raster file.
-
-    Args:
-        console (Console): rich Console object.
-        cleaned_path (str): path to cleaned raster from Stage 2.
-        transform (tuple): geotransform of the original raster.
-        projection (osr.SpatialReference): projection of the original raster.
-        xsize (int): raster width in pixels.
-        ysize (int): raster height in pixels.
-        output_dir (str, optional): path to output directory, if desired.
-        Defaults to None.
-        rasterize (bool, optional): whether or not to write out a skeleton raster.
-        Defaults to False.
-
-    Returns:
-        str: path to skeleton raster.
-    """
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-        task = progress.add_task("Reading cleaned raster...", total=None)
-
-        # Read cleaned raster from disk
-        in_ds = gdal.Open(cleaned_path)
-        cleaned_array = in_ds.GetRasterBand(1).ReadAsArray(0, 0, xsize, ysize)
-        in_ds = None
-
-        progress.update(task, description="Skeletonizing linear features...")
-
-        skeleton = skimage.morphology.skeletonize(cleaned_array).astype(np.uint8)
-        del cleaned_array
-        gc.collect()
-
-        # Write skeleton to temp file if specified
-        # Optionally copy to output dir
-        if rasterize:
-            if output_dir is None:
-                raise ValueError("Output directory must be provided if rasterize=True")
-            
-            progress.update(task, description="Writing skeleton raster...")
-
-            output_tiff = os.path.join(output_dir, "skeleton.tif")
-            driver = gdal.GetDriverByName("GTiff")
-            out_ds = driver.Create(
-                output_tiff, xsize, ysize, 1, gdal.GDT_Byte,
-                options=["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"]
-            )
-            out_ds.SetGeoTransform(transform)
-            out_ds.SetProjection(projection.ExportToWkt())
-            out_band = out_ds.GetRasterBand(1)
-            out_band.SetNoDataValue(255)
-            out_band.WriteArray(skeleton)
-            out_band.FlushCache()
-            out_ds = None
-
-    console.print("\u2713 Skeletonized linear features", style="dim green")
-    
-    return skeleton
-
-# Stage 4: Vectorize
-def vectorize(console: Console, tmp_dir: str, skeleton_array: np.ndarray, transform: tuple, projection: osr.SpatialReference) -> str:
-    """
-    Visits all adjacent skeleton pixel pairs and vectorizes them as
-    LineStrings, writing to a GeoPackage in batches to minimise memory
-    usage.
-
-    Args:
-        console (Console): rich Console object.
-        skeleton_path (str): path to skeleton raster temp file from Stage 3.
-        skeleton_array (np.ndarray): skeleton array from Stage 3.
-        transform (tuple): geotransform of the original raster.
-        projection (osr.SpatialReference): projection of the original raster.
-        output_dir (str): path to the output directory.
-
-    Returns:
-        str: path to the vectorized GeoPackage.
-    """
-    rows, cols = np.where(skeleton_array)
-    skeleton_set = set(zip(rows.tolist(), cols.tolist()))
-    crs = f"EPSG:{projection.GetAuthorityCode(None)}"
-
-    # Clean up skeleton array
-    del skeleton_array
-    gc.collect()
-
-    gpkg_path = os.path.join(tmp_dir, "skeleton_lines.gpkg")
-
-    batch = []
-    first_write = True
-
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-        task = progress.add_task("Vectorizing skeleton...", total=len(skeleton_set))
-
-        for r, c in skeleton_set:
-            for dr, dc in [
-                (0, 1),   # E
-                (1, 0),   # S
-                (1, 1),   # SE
-                (1, -1),  # SW
-            ]:
-                nr, nc = r + dr, c + dc
-                if (nr, nc) in skeleton_set:
-                    x1 = transform[0] + c * transform[1]
-                    y1 = transform[3] + r * transform[5]
-                    x2 = transform[0] + nc * transform[1]
-                    y2 = transform[3] + nr * transform[5]
-                    batch.append(shapely.LineString([(x1, y1), (x2, y2)]))
-
-            if len(batch) >= BATCH_SIZE:
-                gdf = gpd.GeoDataFrame(geometry=batch, crs=crs)
-                if first_write:
-                    gdf.to_file(gpkg_path, driver="GPKG", mode="w", engine="pyogrio")
-                    first_write = False
-                else:
-                    gdf.to_file(gpkg_path, driver="GPKG", mode="a", engine="pyogrio")
-                batch = []
-
-            progress.update(task, advance=1)
-
-        # Write any remaining lines
-        if batch:
-            gdf = gpd.GeoDataFrame(geometry=batch, crs=crs)
-            if first_write:
-                gdf.to_file(gpkg_path, driver="GPKG", mode="w", engine="pyogrio")
-            else:
-                gdf.to_file(gpkg_path, driver="GPKG", mode="a", engine="pyogrio")
-
-    console.print("\u2713 Vectorized skeleton", style="dim green")
-    
-    return gpkg_path
-
-# Stage 5: Close gaps
-def close_gaps(console: Console, tmp_dir: str, gpkg_path: str, projection: osr.SpatialReference, gap_tolerance: float = 10.0, angle_tolerance: float = 30.0) -> str:
-    """
-    Identifies dangling endpoints in the vectorized line network and
-    bridges gaps between them within the gap and angle tolerance.
-
-    Args:
-        console (Console): rich Console object.
-        gpkg_path (str): path to vectorized GeoPackage from Stage 4.
-        output_dir (str): path to the output directory.
-        transform (tuple): geotransform of the original raster.
-        projection (osr.SpatialReference): projection of the original raster.
-        gap_tolerance (float, optional): maximum gap distance in meters.
-        Defaults to 10.0.
-        angle_tolerance (float, optional): maximum bearing difference in
-        degrees. Defaults to 30.0.
-
-    Returns:
-        str: path to GeoPackage with bridging lines appended.
-    """
-    crs = f"EPSG:{projection.GetAuthorityCode(None)}"
-
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-
-        # Pass 1: Count all endpoints to find dangling ones
-        # Read total feature count for progress tracking
-        with fiona.open(gpkg_path) as src:
-            total_lines = len(src)
-
-        task = progress.add_task("Finding dangling endpoints...", total=total_lines)
-
-        endpoint_counts = {}
-        endpoint_to_line = {}
-
-        for chunk in _read_gpkg_chunks(gpkg_path, chunksize=BATCH_SIZE, crs=crs):
-            for idx, row in chunk.iterrows():
-                line = row.geometry
-                if line is None:
-                    continue
-                for point in [line.coords[0], line.coords[-1]]:
-                    if point not in endpoint_counts:
-                        endpoint_counts[point] = 0
-                        endpoint_to_line[point] = idx
-                    endpoint_counts[point] += 1
-                progress.update(task, advance=1)
-
-        dangling = [pt for pt, count in endpoint_counts.items() if count == 1]
-        del endpoint_counts
-        gc.collect()
-
-        # Pass 2: Calculate bearings for dangling endpoints
-        progress.update(task, description="Calculating bearings...", total=len(dangling), completed=0)
-
-        dangling_set = set(dangling)
-        bearings = {}
-        line_idx_map = {}
-
-        for chunk in _read_gpkg_chunks(gpkg_path, chunksize=BATCH_SIZE, crs=crs):
-            for idx, row in chunk.iterrows():
-                line = row.geometry
-                if line is None:
-                    continue
-                start, end = line.coords[0], line.coords[-1]
-                if start in dangling_set:
-                    bearings[start] = _endpoint_bearing(line, at_start=True)
-                    line_idx_map[start] = idx
-                    progress.update(task, advance=1)
-                if end in dangling_set:
-                    bearings[end] = _endpoint_bearing(line, at_start=False)
-                    line_idx_map[end] = idx
-                    progress.update(task, advance=1)
-
-        del dangling_set
-        gc.collect()
-
-        # Build dangling GeoDataFrame for spatial indexing
-        progress.update(task, description="Building spatial index...", total=None, completed=0)
-
-        dangling_gdf = gpd.GeoDataFrame(
-            {
-                "coords": dangling,
-                "bearing": [bearings[pt] for pt in dangling],
-                "line_idx": [line_idx_map[pt] for pt in dangling]
-            },
-            geometry=[shapely.Point(pt) for pt in dangling],
-            crs=crs
-        )
-        del bearings, line_idx_map
-        gc.collect()
-
-        # Find and synthesize bridging lines
-        sindex = dangling_gdf.sindex
-        visited_pairs = set()
-        bridging_lines = []
-
-        progress.update(task, description="Closing gaps...", total=len(dangling_gdf), completed=0)
+    mem_ds.SetGeoTransform(gt)
+    mem_ds.SetProjection(raster_info.projection.ExportToWkt())
+    mem_band = mem_ds.GetRasterBand(1)
+    mem_band.SetNoDataValue(0)
+    mem_band.WriteArray(interior_block)
         
-        bridging_path = os.path.join(tmp_dir, "bridging.gpkg")
-        first_write = True
-
-        for i, row in dangling_gdf.iterrows():
-            buffer = row.geometry.buffer(gap_tolerance)
-            candidates = dangling_gdf.iloc[sindex.query(buffer)]
-            candidates = candidates[candidates.geometry.distance(row.geometry) <= gap_tolerance]
-
-            for j, candidate in candidates.iterrows():
-                if i == j:
-                    continue
-                pair = tuple(sorted((i, j)))
-                if pair in visited_pairs:
-                    continue
-                visited_pairs.add(pair)
-
-                if row["line_idx"] == candidate["line_idx"]:
-                    continue
-
-                angle_diff = abs(row["bearing"] - candidate["bearing"]) % 360
-                angle_diff = min(angle_diff, 360 - angle_diff)
-                is_similar = angle_diff <= angle_tolerance
-                is_opposite = abs(angle_diff - 180) <= angle_tolerance
-                if not (is_similar or is_opposite):
-                    continue
-
-                bridging_lines.append(shapely.LineString([row.geometry, candidate.geometry]))
-
-            # Write bridging lines in batches
-            if len(bridging_lines) >= BATCH_SIZE:
-                bridging_gdf = gpd.GeoDataFrame(geometry=bridging_lines, crs=crs)
-                if first_write:
-                    bridging_gdf.to_file(bridging_path, driver="GPKG", mode="w", engine="pyogrio")
-                    first_write = False
-                else:
-                    bridging_gdf.to_file(bridging_path, driver="GPKG", mode="a", engine="pyogrio")
-                bridging_lines = []
-
-            progress.update(task, advance=1)
-
-        # Write remaining bridging lines
-        if bridging_lines:
-            bridging_gdf = gpd.GeoDataFrame(geometry=bridging_lines, crs=crs)
-            if first_write:
-                bridging_gdf.to_file(bridging_path, driver="GPKG", mode="w", engine="pyogrio")
-            else:
-                bridging_gdf.to_file(bridging_path, driver="GPKG", mode="a", engine="pyogrio")
-            
-    console.print(f"\u2713 Closed gaps", style="dim green")
+    # Create blank vector dataset in memory for polygonization
+    block_polygons_path = os.path.join(output_dir, f"{block_info.block_id}_polygons.fgb")
+    block_polygons = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(block_polygons_path)
+    polygons_layer = block_polygons.CreateLayer("enclosed_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon)
+    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
+    polygons_layer.CreateField(fieldname)
     
-    return bridging_path
+    # Polygonize
+    gdal.Polygonize(mem_band, mem_band, polygons_layer, 0, [], callback=None)
+    nb_polygons = len(polygons_layer)
 
-# Stage 6: Merge and export
-def merge_and_export(console: Console, gpkg_path: str, bridging_path: str, input_file: str, output_dir: str, transform: tuple, projection: osr.SpatialReference) -> str:
-    """
-    Reads the vectorized lines GeoPackage in chunks, incrementally unions
-    and merges them, simplifies to remove staircase artifacts, and writes
-    the result to a GeoPackage.
+    mem_ds = None
+    block_polygons = None
 
-    Args:
-        console (Console): rich Console object.
-        gpkg_path (str): path to vectorized GeoPackage from Stage 5.
-        input_file (str): input filename stem for output naming.
-        output_dir (str): path to the output directory.
-        transform (tuple): geotransform of the original raster.
-        projection (osr.SpatialReference): projection of the original raster.
-
-    Returns:
-        str: path to merged GeoPackage.
-    """
-    crs = f"EPSG:{projection.GetAuthorityCode(None)}"
-    with fiona.open(gpkg_path) as src:
-        total_lines = len(src)
-    if os.path.exists(bridging_path):
-        with fiona.open(bridging_path) as src2:
-            total_lines += len(src2)
-        
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-
-        task = progress.add_task("Merging lines...", total=total_lines)
-
-        # Incrementally union chunks together
-        accumulated = None
-
-        for path in [gpkg_path, bridging_path]:
-            if not os.path.exists(path):
-                continue
-            for chunk in _read_gpkg_chunks(gpkg_path, chunksize=BATCH_SIZE, crs=crs):
-                chunk_union = shapely.union_all(chunk.geometry.values)
-                if accumulated is None:
-                    accumulated = chunk_union
-                else:
-                    accumulated = accumulated.union(chunk_union)
-                del chunk, chunk_union
-                gc.collect()
-                progress.update(task, advance=BATCH_SIZE)
-
-        # Merge, simplify
-        progress.update(task, description="Simplifying...", total=None, completed=0)
-        merged = shapely.line_merge(accumulated)
-        del accumulated
-        gc.collect()
-
-        merged = merged.simplify(tolerance=transform[1])
-
-        # Explode MultiLineString to individual geometries
-        if merged.geom_type == "MultiLineString":
-            geometries = list(merged.geoms)
-        else:
-            geometries = [merged]
-        del merged
-        gc.collect()
-
-        # Write to GeoPackage in batches
-        progress.update(task, description="Writing GeoPackage...", total=len(geometries), completed=0)
-        merged_path = os.path.join(output_dir, f"{input_file}_linear_features.gpkg")
-        first_write = True
-
-        for i in range(0, len(geometries), BATCH_SIZE):
-            batch = geometries[i:i + BATCH_SIZE]
-            gdf = gpd.GeoDataFrame(geometry=batch, crs=crs)
-            if first_write:
-                gdf.to_file(merged_path, driver="GPKG", mode="w", engine="pyogrio")
-                first_write = False
-            else:
-                gdf.to_file(merged_path, driver="GPKG", mode="a", engine="pyogrio")
-            progress.update(task, advance=len(batch))
+    return nb_polygons
     
-    console.print("\u2713 Merged and exported", style="dim green")
-    
-    return merged_path
-
-# Stage 7: Polygonize
-def polygonize(console: Console, merged_path: str, input_file: str, output_dir: str, projection: osr.SpatialReference, max_area: float = None) -> None:
-    """
-    Extracts polygons enclosed by the merged lines and writes them to a
-    GeoPackage in the output directory.
-
-    Args:
-        console (Console): rich Console object.
-        merged_path (str): path to merged lines GeoPackage from Stage 6.
-        input_file (str): input filename stem for output naming.
-        output_dir (str): path to the output directory.
-        projection (osr.SpatialReference): projection of the original raster.
-        max_area (float, optional): maximum polygon area in square meters
-        to retain. Defaults to None.
-    """
-    crs = f"EPSG:{projection.GetAuthorityCode(None)}"
-    with fiona.open(merged_path) as src:
-        total_lines = len(src)
-
-    with Progress(SpinnerColumn(),
-                  "[progress.description]{task.description}",
-                  MofNCompleteColumn(),
-                  TimeElapsedColumn(),
-                  transient=True,
-                  console=console) as progress:
-
-        # Incrementally union chunks to build noded geometry
-        task = progress.add_task("Noding lines...", total=total_lines)
-        accumulated = None
-
-        for chunk in _read_gpkg_chunks(merged_path, chunksize=BATCH_SIZE, crs=crs):
-            chunk_union = shapely.union_all(chunk.geometry.values)
-            if accumulated is None:
-                accumulated = chunk_union
-            else:
-                accumulated = accumulated.union(chunk_union)
-            del chunk, chunk_union
-            gc.collect()
-            progress.update(task, advance=BATCH_SIZE)
-
-        # Polygonize
-        progress.update(task, description="Polygonizing...", total=None, completed=0)
-        polygons = list(shapely.ops.polygonize(accumulated))
-        del accumulated
-        gc.collect()
-
-        if not polygons:
-            console.print("No enclosed polygons found", style="dim yellow")
-            return
-
-        # Filter and write in batches
-        progress.update(task, description="Writing polygons...", total=len(polygons), completed=0)
-        output_path = os.path.join(output_dir, f"{input_file}_plots.gpkg")
-        first_write = True
-
-        for i in range(0, len(polygons), BATCH_SIZE):
-            batch = polygons[i:i + BATCH_SIZE]
-            batch_gdf = gpd.GeoDataFrame(geometry=batch, crs=crs)
-            batch_gdf["area_m2"] = batch_gdf.geometry.area
-
-            if max_area is not None:
-                batch_gdf = batch_gdf[batch_gdf["area_m2"] <= max_area]
-
-            if batch_gdf.empty:
-                continue
-
-            if first_write:
-                batch_gdf.to_file(output_path, driver="GPKG", mode="w", engine="pyogrio")
-                first_write = False
-            else:
-                batch_gdf.to_file(output_path, driver="GPKG", mode="a", engine="pyogrio")
-
-            progress.update(task, advance=len(batch))
-
-    console.print(f"\u2713 Polygonized linear features", style="dim green")
-    
+# =============================================================================
 # Extract polygons
-def extract_polygons(linear_features_path, input_file, output_dir, verbose=False, probability_threshold=50, closing_radius=2, min_area=50, sk_raster=False, gap_tolerance=10.0, angle_tolerance=30.0, max_area=None) -> None:
-    # Setup
-    console = Console(quiet=not verbose)
-    console.print(f"\nEXTRACTING POLYGONS FROM {os.path.basename(linear_features_path)}", style="bold cyan")
-    tmp_dir = tempfile.mkdtemp()
+# =============================================================================
+def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_dist, gap_threshold, prob_threshold, min_area):
+    # Check for buffer distance/gap threshold tolerance
+    if buffer_dist < gap_threshold:
+        log.warning(
+            f"Buffer ({buffer_dist}) < gap threshold ({gap_threshold})."
+            "Edge artifacts are likely. Consider setting buffer distance >= gap threshold")
     
-    try:
-        # Stage 1: Load linear features
-        thresholded_path, transform, projection, xsize, ysize = load_linear_features(console, tmp_dir, linear_features_path, probability_threshold)
-        
-        # Stage 2: Morphological cleaning
-        cleaned_path = morphological_clean(console, tmp_dir, thresholded_path, transform, projection, xsize, ysize, closing_radius, min_area)
-        
-        # Stage 3: Skeletonize
-        skeleton_array = skeletonize(console, cleaned_path, transform, projection, xsize, ysize, output_dir, sk_raster)
-        
-        # Stage 4: Vectorize
-        vectorized_gpkg = vectorize(console, tmp_dir, skeleton_array, transform, projection)
-        
-        # Stage 5: Close gaps
-        closed_gaps_gpkg = close_gaps(console, tmp_dir, vectorized_gpkg, projection, gap_tolerance, angle_tolerance)
-        
-        # Stage 6: Merge and export
-        merged_path = merge_and_export(console, vectorized_gpkg, closed_gaps_gpkg, input_file, output_dir, transform, projection)
-        
-        # Stage 7: Polygonize
-        polygonize(console, merged_path, input_file, output_dir, projection, max_area)
+    # Step 1: load block
+    block, block_info, raster_info = load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold)
     
-        # End message
-        console.print(f"\nExtracted polygons written to {output_dir}\n", style="bold green")
+    # Step 2: close gaps
+    closed_lines = close_gaps(block, gap_threshold)
     
-    except Exception as e:
-        console.print(f"\n\u2717Error during extraction: {e}", style="bold red")
-        console.print_exception()
-        raise
+    # Step 3: find enclosed polygons
+    polygons = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
+        
+    if polygons == 0:
+        log.debug("no enclosed polygons found")
+        return {
+            "block_id": block_id,
+            "status": "null",
+            "polygon_count": 0,
+            "polygons": polygons
+        }
+
+    return {
+        "block_id": block_id,
+        "status": "success",
+        "polygon_count": polygons,
+        "polygons": polygons
+    }
     
-    finally:
-        shutil.rmtree(tmp_dir)
-    
-# Main function
+
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
-    # Create argument parser
-    parser = argparse.ArgumentParser(description="Script to find areas enclosed by linear features")
-    parser.add_argument("-p", "--linear-features-path", type=str, help="Path to linear features input raster", required=True)
-    parser.add_argument("-od", "--output-dir", type=str, help="Output directory", required=True)
-    parser.add_argument("-sk", "--sk-raster", action="store_true", help="Whether or not to write out skeleton raster")
-    parser.add_argument("-t", "--probability-threshold", type=int, default=50, help="Probability threshold of line features")
-    parser.add_argument("-cr", "--closing-radius", type=int, default=2, help="Pixels to consider for initial gap bridging")
-    parser.add_argument("-ma", "--min-area", type=int, default=50, help="Component size (in pixels) to retain")
-    parser.add_argument("-gt", "--gap-tolerance", type=float, default=10.0, help="Gap tolerance for closing gaps")
-    parser.add_argument("-at", "--angle-tolerance", type=float, default=30.0, help="Angle tolerance for closing gaps")
-    parser.add_argument("-max", "--max-area", type=float, default=None, help="Maximum area for extracted plots")
+    # Make output folders
+    output_block_dir = os.path.join(OUTPUT_DIR, "block_polygons")
+    os.makedirs(output_block_dir, exist_ok=True)
     
-    # Parse arguments, set up variables
-    args = parser.parse_args()
-    linear_features_path = args.linear_features_path
-    output_dir = args.output_dir
-    sk_raster = args.sk_raster
-    probability_threshold = args.probability_threshold
-    closing_radius = args.closing_radius
-    min_area = args.min_area
-    gap_tolerance = args.gap_tolerance
-    angle_tolerance = args.angle_tolerance
-    max_area = args.max_area
+    # Open raster dataset and get number of blocks
+    info = get_raster_info(INPUT_RASTER)
     
-    verbose = True
-    input_file = os.path.splitext(os.path.basename(linear_features_path))[0]
-    os.makedirs(output_dir, exist_ok=True)
+    nx = math.ceil(info.cols / BLOCKSIZE)
+    ny = math.ceil(info.rows / BLOCKSIZE)
+    total_blocks = nx * ny
+    
+    # Set up arguments for parallel processing
+    worker_args = [
+        (block_id, output_block_dir, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD, MIN_AREA)
+        for block_id in range(total_blocks)
+    ]
+    
+    # Parallel process
+    completed_blocks = []
+    with Progress(
+        SpinnerColumn(),
+        "[progress.description]{task.description}",
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
 
-    # Extract polygons
-    try:
-        extract_polygons(linear_features_path, input_file, output_dir, verbose, probability_threshold, closing_radius, min_area, sk_raster, gap_tolerance, angle_tolerance, max_area)
-    except Exception:
-        sys.exit(1)
-    sys.exit(0)
+        task = progress.add_task("Getting polygons by block...", total=len(worker_args))
 
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+            futures = {pool.submit(extract_polygons, *args): args[0] for args in worker_args}
+            for future in as_completed(futures):
+                block_id = futures[future]
+                try:
+                    result = future.result()
+                    if result["status"] == "success":
+                        completed_blocks.append(result["block_id"])
+                        log.info(f"{result['block_id']}: {result['status']}")
+                    elif result["status"] == "null":
+                        log.warning(f"{result['block_id']}: no enclosed polygons found, skipped")
+                    else:
+                        log.error(f"{result['block_id']}: {result.get('reason', 'unknown error')}")
+                except Exception as exc:
+                    log.error(f"{block_id} failed: {exc}")
+                finally:
+                    progress.update(task, advance=1)
+
+    console.print(f"{len(completed_blocks)} blocks written successfully.")
+    
+    # Create output geopackage for polygons
+    with Progress(
+            SpinnerColumn(),
+            "[progress.description]{task.description}",
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+
+        total_to_merge = os.listdir(output_block_dir)
+        if total_to_merge:
+            task = progress.add_task("Merging polygons...", total=len(total_to_merge))
+
+            output_vector_path = os.path.join(OUTPUT_DIR, "polygons.fgb")
+            input_files = [os.path.join(output_block_dir, file) for file in os.listdir(output_block_dir)]
+            out_ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(output_vector_path)
+            out_layer = out_ds.CreateLayer("merged_polygons", srs=info.projection, geom_type=ogr.wkbPolygon)
+
+            for file in input_files:
+                if file.endswith(".fgb"):
+                    ds = ogr.Open(file)
+                    lyr = ds.GetLayer()
+                    for feat in lyr:
+                        out_feat = ogr.Feature(out_layer.GetLayerDefn())
+                        out_feat.SetGeometry(feat.GetGeometryRef().Clone())
+                        out_layer.CreateFeature(out_feat)
+                        out_layer.SyncToDisk()
+                        out_feat = None
+                    
+                    ds = None
+
+                progress.update(task, advance=1)
+            
+            out_ds = None
+            
+    
 if __name__ == "__main__":
     main()
