@@ -35,7 +35,7 @@ BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 1024   # Size of the surrounding buffer
 GAP_THRESHOLD = 30   # Maximum size of gaps to close (in pixels)
 PROBABILITY_THRESHOLD = 15  # For linear features
-MIN_AREA = 80        # Minimum size of extracted polygons (in pixels)
+MIN_AREA = 40        # Minimum size of extracted polygons (in pixels)
 
 #* ---DEBUG---
 if os.path.exists(OUTPUT_DIR):
@@ -288,6 +288,11 @@ def close_gaps(block, gap_threshold):
     # Find endpoints
     kernel = np.ones((3, 3), dtype=np.uint8)
     neighbor_count = ndimage.convolve(skeleton, kernel, mode='constant', cval=0)
+    
+    # Remove pixels with no neighbors
+    skeleton[neighbor_count == 1] = 0
+    
+    # Store endpoints
     endpoints = (skeleton == 1) & (neighbor_count == 2) # Count: itself & neighbor
     ep_coords = list(zip(*np.where(endpoints)))
     result = skeleton.copy()
