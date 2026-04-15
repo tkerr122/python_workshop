@@ -29,7 +29,7 @@ NEXT STAGE:
 # =============================================================================
 BLOCK_ID = 0
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/test_tile.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_tile2"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_tile_new"
 N_WORKERS = 180      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 1024   # Size of the surrounding buffer
@@ -146,7 +146,6 @@ def write_block_debug(block_info, raster_info, output_path):
         layer.CreateFeature(feat)
 
     ds = None
-
 
 
 def get_raster_info(raster_path):
@@ -280,11 +279,9 @@ def merge_vectors(input_dir, output_path, info, progress, task):
 # Driver functions
 # =============================================================================
 def close_gaps(block, gap_threshold):
-    bool_arr = block.astype(bool)
-    
     # Skeletonize
+    bool_arr = block.astype(bool)
     skeleton = skeletonize(bool_arr).astype(np.uint8)
-    
     if not skeleton.any():
         log.debug("skeletonize failed, thresholded array is empty")
 
@@ -292,25 +289,34 @@ def close_gaps(block, gap_threshold):
     kernel = np.ones((3, 3), dtype=np.uint8)
     neighbor_count = ndimage.convolve(skeleton, kernel, mode='constant', cval=0)
     endpoints = (skeleton == 1) & (neighbor_count == 2) # Count: itself & neighbor
-
-    # Close the gaps
     ep_coords = list(zip(*np.where(endpoints)))
-    labeled, _ = ndimage.label(skeleton)
     result = skeleton.copy()
-    
     if len(ep_coords) < 2:
         return result
+    
+    # Get all other pixels
+    skel_coords = np.array(list(zip(*np.where(skeleton == 1))))
+    tree = cKDTree(skel_coords)
 
+    # Find and label segments
+    structure = ndimage.generate_binary_structure(2, 2)
+    labeled, _ = ndimage.label(skeleton, structure=structure)
+
+    # Close gaps with shortest distance
     for i, (r1, c1) in enumerate(ep_coords):
         best_dist = np.inf
         best_coord = None
 
-        for j, (r2, c2) in enumerate(ep_coords):
-            if labeled[r1, c1] == labeled[r2, c2]:  # skip if already a part of the skeleton
+        indices = tree.query_ball_point([r1, c1], gap_threshold)
+        for idx in indices:
+            r2, c2 = skel_coords[idx]
+            
+            # Skip if already a part of the skeleton
+            if labeled[r1, c1] == labeled[r2, c2]:
                 continue
 
             dist = np.hypot(r2 - r1, c2 - c1)
-            if dist <= gap_threshold and dist < best_dist:
+            if dist < best_dist:
                 best_dist = dist
                 best_coord = (r2, c2)
 
