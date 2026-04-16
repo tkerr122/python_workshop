@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
 from dataclasses import dataclass, field
 import numpy as np
-import os, logging, math, shutil
+import os, logging, math
 
 # Env settings
 gdal.UseExceptions()
@@ -27,8 +27,9 @@ NEXT STAGE:
 # =============================================================================
 # GLOBALS
 # =============================================================================
+BLOCK_ID = 42
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/v1_test_lines.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/fieldname_test"
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/block42"
 N_WORKERS = 100      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 2048   # Size of the surrounding buffer
@@ -329,8 +330,10 @@ def close_gaps(block, gap_threshold):
             valid = (rr >= 0) & (rr < skeleton.shape[0]) & \
                     (cc >= 0) & (cc < skeleton.shape[1])
             result[rr[valid], cc[valid]] = 1
-            
-    return result
+    
+    #* ---DEBUG---            
+    # return result
+    return result, skeleton
 
 def find_enclosed_polygons(closed_lines: np.ndarray, output_dir: str, block_info: BlockInfo, raster_info: RasterInfo, min_area):
     # Get interior pixels within block & buffer
@@ -391,8 +394,9 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
     # Step 1: load block
     block, block_info, raster_info = load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold)
     
-    # Step 2: close gaps
-    closed_lines = close_gaps(block, gap_threshold)
+    #* ---DEBUG--- Step 2: close gaps
+    # closed_lines = close_gaps(block, gap_threshold)
+    closed_lines, skeleton = close_gaps(block, gap_threshold)
     
     # Step 3: find enclosed polygons
     polygons = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
@@ -404,6 +408,41 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
             "polygon_count": 0,
             "polygons": polygons
         }
+    
+    #* ---DEBUG---
+    block_info_path = os.path.join(OUTPUT_DIR, "block_info.fgb")
+    skeleton_path = os.path.join(OUTPUT_DIR, "skeleton.tif")
+    closed_lines_path = os.path.join(OUTPUT_DIR, "closed_lines.tif")
+    write_block_debug(block_info, raster_info, output_path=block_info_path)
+    
+    write_col = block_info.buf_col
+    write_row = block_info.buf_row
+    write_width = block_info.buf_width
+    write_height = block_info.buf_height
+    gt = list(raster_info.transform)
+    gt[0] = raster_info.xmin + write_col * raster_info.pixel_width   # x origin
+    gt[3] = raster_info.ymax + write_row * raster_info.pixel_height  # y origin
+
+    skeleton_ds = gdal.GetDriverByName("GTiff").Create(
+        skeleton_path, write_width, write_height, 1, gdal.GDT_Byte
+    )
+    skeleton_ds.SetGeoTransform(gt)
+    skeleton_ds.SetProjection(raster_info.projection.ExportToWkt())
+    skeleton_band = skeleton_ds.GetRasterBand(1)
+    skeleton_band.SetNoDataValue(0)
+    skeleton_band.WriteArray(skeleton)
+    
+    closed_ds = gdal.GetDriverByName("GTiff").Create(
+        closed_lines_path, write_width, write_height, 1, gdal.GDT_Byte
+    )
+    closed_ds.SetGeoTransform(gt)
+    closed_ds.SetProjection(raster_info.projection.ExportToWkt())
+    closed_band = closed_ds.GetRasterBand(1)
+    closed_band.SetNoDataValue(0)
+    closed_band.WriteArray(closed_lines)
+    
+    skeleton_ds = None
+    closed_ds = None
     
     return {
         "block_id": block_id,
@@ -486,4 +525,8 @@ def main():
             
     
 if __name__ == "__main__":
-    main()
+    # main()
+    console.print(f"Processing block {BLOCK_ID}...")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    result = extract_polygons(BLOCK_ID, OUTPUT_DIR, INPUT_RASTER, BLOCKSIZE, BUFFER_DIST, GAP_THRESHOLD, PROBABILITY_THRESHOLD, MIN_AREA)
+    console.print(result)
