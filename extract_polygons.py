@@ -16,20 +16,13 @@ gdal.UseExceptions()
 gdal.ConfigurePythonLogging(logger_name="log")
 console = Console()
 
-"""
-# =============================================================================
-# NOTES
-# =============================================================================
-NEXT STAGE:
-- Need to figure out how to merge the flatgeobufs at the end
-"""
 
 # =============================================================================
 # GLOBALS
 # =============================================================================
-BLOCK_ID = 42
+BLOCK_ID = 44
 INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/v1_test_lines.tif"
-OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/block42"
+OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/block{BLOCK_ID}"
 N_WORKERS = 100      # Number of CPUs to use
 BLOCKSIZE = 2048     # Size of the block
 BUFFER_DIST = 2048   # Size of the surrounding buffer
@@ -276,7 +269,7 @@ def merge_vectors(input_dir, output_path, info, progress, task):
 # =============================================================================
 # Driver functions
 # =============================================================================
-def close_gaps(block, gap_threshold):
+def close_gaps(block, gap_threshold, block_info):
     # Skeletonize
     bool_arr = block.astype(bool)
     skeleton = skeletonize(bool_arr).astype(np.uint8)
@@ -301,9 +294,20 @@ def close_gaps(block, gap_threshold):
     skel_coords = np.array(list(zip(*np.where(skeleton == 1))))
     tree = cKDTree(skel_coords)
 
-    # Find and label segments
+    # Create labeling scheme for connected segments
+    inner_mask = np.zeros_like(skeleton, dtype=bool)
+    inner_mask[
+        block_info.inner_row_offset : block_info.inner_row_offset + block_info.block_height,
+        block_info.inner_col_offset : block_info.inner_col_offset + block_info.block_width
+    ] = True
+
+    # Label over full buffer extent
     structure = ndimage.generate_binary_structure(2, 2)
-    labeled, _ = ndimage.label(skeleton, structure=structure)
+    labeled_buffer, _ = ndimage.label(skeleton, structure=structure)
+
+    # Label over inner block only
+    skeleton_inner = skeleton * inner_mask.astype(np.uint8)
+    labeled_inner, _ = ndimage.label(skeleton_inner, structure=structure)
 
     # Close gaps with shortest distance
     for i, (r1, c1) in enumerate(ep_coords):
@@ -311,11 +315,20 @@ def close_gaps(block, gap_threshold):
         best_coord = None
 
         indices = tree.query_ball_point([r1, c1], gap_threshold)
+        
+        # Create segment labels
+        l1_buf = labeled_buffer[r1, c1]
+        l1_inn = labeled_inner[r1, c1]
+        
         for idx in indices:
             r2, c2 = skel_coords[idx]
             
-            # Skip if already a part of the skeleton
-            if labeled[r1, c1] == labeled[r2, c2]:
+            # Segment labels
+            l2_buf = labeled_buffer[r2, c2]
+            l2_inn = labeled_inner[r2, c2]
+            
+            # Skip only if connected in BOTH labelings
+            if l1_inn == l2_inn and l1_buf == l2_buf:
                 continue
 
             dist = np.hypot(r2 - r1, c2 - c1)
@@ -396,7 +409,7 @@ def extract_polygons(block_id, output_dir, input_raster_path, blocksize, buffer_
     
     #* ---DEBUG--- Step 2: close gaps
     # closed_lines = close_gaps(block, gap_threshold)
-    closed_lines, skeleton = close_gaps(block, gap_threshold)
+    closed_lines, skeleton = close_gaps(block, gap_threshold, block_info)
     
     # Step 3: find enclosed polygons
     polygons = find_enclosed_polygons(closed_lines, output_dir, block_info, raster_info, min_area)
