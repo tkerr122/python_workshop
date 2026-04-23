@@ -440,7 +440,7 @@ def main():
 
     console.print(f"{len(completed_blocks)} blocks written successfully.")
     
-    # Create output geopackage for polygons
+    # Merge block polygons
     with Progress(
             SpinnerColumn(),
             "[progress.description]{task.description}",
