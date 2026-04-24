@@ -6,7 +6,13 @@ from skimage.draw import line as draw_line
 from skimage.morphology import skeletonize
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.progress import (
+    Progress,
+    TaskID,
+    SpinnerColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn,
+)
 from dataclasses import dataclass, field
 import numpy as np
 import os, logging, math
@@ -54,7 +60,7 @@ log = logging.getLogger(__name__)
 # =============================================================================
 @dataclass
 class BlockInfo:
-    """Class to store block info for later access."""
+    """Class to store block info"""
 
     # Block's id
     block_id: int
@@ -105,7 +111,7 @@ class RasterInfo:
 # =============================================================================
 # Utility functions
 # =============================================================================
-def get_raster_info(raster_path):
+def get_raster_info(raster_path: str) -> RasterInfo:
     """Opens a raster using GDAL and gets columns (xsize), rows (ysize),
     geotransform, and projection (as a spatial reference object)
 
@@ -128,15 +134,17 @@ def get_raster_info(raster_path):
     return info
 
 
-def get_block_info(block_id, raster_info, blocksize, buffer):
+def get_block_info(
+    block_id: int, raster_info: RasterInfo, blocksize: int, buffer: int
+) -> BlockInfo:
     """Locates a block based on the block_id in the raster and computes a
     BlockInfo object with associated buffer zone.
 
     Args:
-        block_id (int): block's unique id
+        block_id (int): Block's unique id
         raster_info (RasterInfo): RasterInfo object from the input raster
-        blocksize (int): size of the block, in pixels
-        buffer (int): size of the buffer, in pixels
+        blocksize (int): Size of the block, in pixels
+        buffer (int): Size of the buffer, in pixels
 
     Raises:
         ValueError: If block id exceeds the bounds of the raster
@@ -185,19 +193,25 @@ def get_block_info(block_id, raster_info, blocksize, buffer):
     )
 
 
-def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_threshold):
+def load_block(
+    block_id: int,
+    input_raster_path: str,
+    blocksize: int,
+    buffer_dist: int,
+    prob_threshold: int,
+) -> tuple:
     """Loads a block and associated information, and thresholds it to the given
     probability threshold.
 
     Args:
-        block_id (int): block's unique id
-        input_raster_path (str): path to raster
-        blocksize (int): size of the block, in pixels
-        buffer_dist (int): size of the buffer, in pixels
-        prob_threshold (int): probability threshold for the block
+        block_id (int): Block's unique id
+        input_raster_path (str): Path to raster
+        blocksize (int): Size of the block, in pixels
+        buffer_dist (int): Size of the buffer, in pixels
+        prob_threshold (int): Probability threshold for the block
 
     Returns:
-        tuple: block as numpy array, BlockInfo, RasterInfo
+        tuple: Block as numpy array, BlockInfo, RasterInfo
     """
     # Get raster info
     raster_info = get_raster_info(input_raster_path)
@@ -226,7 +240,17 @@ def load_block(block_id, input_raster_path, blocksize, buffer_dist, prob_thresho
     return block, block_info, raster_info
 
 
-def get_interior(closed_lines, min_area):
+def get_interior(closed_lines: np.ndarray, min_area: int) -> np.ndarray:
+    """Finds areas enclosed by lines, which would be areas of zeros fully
+    enclosed by ones.
+
+    Args:
+        closed_lines (np.array): Lines array with gaps closed
+        min_area (int): Minimum area for the interior areas, in pixels
+
+    Returns:
+        np.array: Array as np.uint16 data type
+    """
     # Find the pixels that are fully enclosed by lines and not lines
     background = closed_lines == 0
 
@@ -259,7 +283,16 @@ def get_interior(closed_lines, min_area):
     return interior.astype(np.uint16)
 
 
-def merge_vectors(input_dir, output_path, raster_info, progress, task):
+def merge_vectors(
+    input_dir: str,
+    output_path: str,
+    raster_info: RasterInfo,
+    progress: Progress,
+    task: TaskID,
+) -> None:
+    """
+    WILL WRITE DOCSTRING AFTER UPDATING THIS METHOD
+    """
     out_ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(output_path)
     out_layer = out_ds.CreateLayer(
         "merged_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon
@@ -291,7 +324,20 @@ def merge_vectors(input_dir, output_path, raster_info, progress, task):
 # =============================================================================
 # Driver functions
 # =============================================================================
-def close_gaps(block, gap_threshold, block_info):
+def close_gaps(
+    block: np.ndarray, gap_threshold: int, block_info: BlockInfo
+) -> np.ndarray:
+    """Uses the gap threshold and ndimage convolution and labeling to find and
+    close gaps between skeleton endpoints.
+
+    Args:
+        block (np.ndarray): Array for the block
+        gap_threshold (int): Maximum gap size to bridge, in pixels
+        block_info (BlockInfo): BlockInfo object
+
+    Returns:
+        np.ndarray: Block array with the gaps closed
+    """
     # Skeletonize
     bool_arr = block.astype(bool)
     skeleton = skeletonize(bool_arr).astype(np.uint8)
@@ -313,11 +359,11 @@ def close_gaps(block, gap_threshold, block_info):
         log.debug("No skeleton endpoints found, no gaps closed")
         return result
 
-    # Get all other pixels
+    # Get all other pixels, create KDTree for faster lookup
     skel_coords = np.array(list(zip(*np.where(skeleton == 1))))
     tree = cKDTree(skel_coords)
 
-    # Create labeling scheme for connected segments
+    # Create labeling scheme for segments only connected in the block
     inner_mask = np.zeros_like(skeleton, dtype=bool)
     inner_mask[
         block_info.inner_row_offset : block_info.inner_row_offset
@@ -339,6 +385,7 @@ def close_gaps(block, gap_threshold, block_info):
         best_dist = np.inf
         best_coord = None
 
+        # Initialize the KDTree at gap_threshold distance
         indices = tree.query_ball_point([r1, c1], gap_threshold)
 
         # Create segment labels
@@ -352,7 +399,7 @@ def close_gaps(block, gap_threshold, block_info):
             l2_buf = labeled_buffer[r2, c2]
             l2_inn = labeled_inner[r2, c2]
 
-            # Skip only if connected in BOTH labelings
+            # Skip only if connected in BOTH block and buffer
             if l1_inn == l2_inn and l1_buf == l2_buf:
                 continue
 
@@ -361,9 +408,11 @@ def close_gaps(block, gap_threshold, block_info):
                 best_dist = dist
                 best_coord = (r2, c2)
 
+        # Draw the line between endpoint to close the gap
         if best_coord is not None:
             r2, c2 = best_coord
             rr, cc = draw_line(int(r1), int(c1), int(r2), int(c2))
+
             # Clip to array bounds just in case
             valid = (
                 (rr >= 0)
@@ -381,8 +430,21 @@ def find_enclosed_polygons(
     output_dir: str,
     block_info: BlockInfo,
     raster_info: RasterInfo,
-    min_area,
-):
+    min_area: int,
+) -> int:
+    """Uses the get_interior function to find areas enclosed by lines and
+    writes them to a block-wide FlatGeobuf file.
+
+    Args:
+        closed_lines (np.ndarray): Array of lines with gaps closed
+        output_dir (str): Path to output directory
+        block_info (BlockInfo): BlockInfo object
+        raster_info (RasterInfo): RasterInfo object
+        min_area (int): Minimum area for enclosed areas
+
+    Returns:
+        int: Number of enclosed polygons found
+    """
     # Get interior pixels within block & buffer
     interior_buffer = get_interior(closed_lines, min_area)
 
@@ -445,20 +507,21 @@ def find_enclosed_polygons(
 # Extract polygons
 # =============================================================================
 def extract_polygons(
-    block_id,
-    output_dir,
-    input_raster_path,
-    blocksize,
-    buffer_dist,
-    gap_threshold,
-    prob_threshold,
-    min_area,
-):
+    block_id: int,
+    output_dir: str,
+    input_raster_path: str,
+    blocksize: int,
+    buffer_dist: int,
+    gap_threshold: int,
+    prob_threshold: int,
+    min_area: int,
+) -> dict:
     # Check for buffer distance/gap threshold tolerance
     if buffer_dist < gap_threshold:
         log.warning(
             f"Buffer ({buffer_dist}) < gap threshold ({gap_threshold})."
-            "Edge artifacts are likely. Consider setting buffer distance >= gap threshold"
+            "Edge artifacts are likely."
+            "Consider setting buffer distance >= gap threshold"
         )
 
     # Step 1: load block
