@@ -18,7 +18,7 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import networkx as nx
-import os, logging, math, fiona, dask_geopandas
+import os, logging, math, fiona
 
 # Env settings
 gdal.UseExceptions()
@@ -42,12 +42,13 @@ MIN_AREA = 80  # Minimum size of extracted polygons (in pixels)
 # Logging setup using Rich
 # -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(
             os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "log_polygon_extractor.log"
+                os.path.dirname(os.path.abspath(__file__)),
+                "log_extract_polygons_by_block.log",
             ),
             mode="w",
         )
@@ -347,12 +348,6 @@ def merge_vectors(
 
     gdf = pd.concat(gdfs, ignore_index=True)
     gdf = gpd.GeoDataFrame(gdf, crs=gdfs[0].crs)
-
-    dask_gdf = dask_geopandas.from_geopandas(gdf, npartitions=num_workers)
-    dask_gdf["geometry"] = dask_gdf.geometry.buffer(snap_tolerance).buffer(
-        -snap_tolerance
-    )
-    gdf = dask_gdf.compute()
 
     # Fix floating point gaps at tile seams
     snap_task = progress.add_task("Snapping tile seams...", total=None)
