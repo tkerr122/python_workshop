@@ -4,18 +4,21 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 from skimage.draw import line as draw_line
 from skimage.morphology import skeletonize
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from shapely.ops import unary_union
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import (
     Progress,
-    TaskID,
     SpinnerColumn,
     TimeElapsedColumn,
     MofNCompleteColumn,
 )
 from dataclasses import dataclass, field
 import numpy as np
-import os, logging, math
+import geopandas as gpd
+import pandas as pd
+import networkx as nx
+import os, logging, math, fiona, dask_geopandas
 
 # Env settings
 gdal.UseExceptions()
@@ -26,10 +29,8 @@ console = Console()
 # =============================================================================
 # GLOBALS
 # =============================================================================
-INPUT_RASTER = (
-    "/gpfs/glad1/Theo/Data/Pastures_test/Linear_features_raster/lines_v03.tif"
-)
-OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/all_patagonia"
+INPUT_RASTER = "/gpfs/glad1/Theo/Data/Pastures_test/v1_test_lines.tif"
+OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/test_output2"
 N_WORKERS = 100  # Number of CPUs to use
 BLOCKSIZE = 2048  # Size of the block
 BUFFER_DIST = 2048  # Size of the surrounding buffer
@@ -283,42 +284,118 @@ def get_interior(closed_lines: np.ndarray, min_area: int) -> np.ndarray:
     return interior.astype(np.uint16)
 
 
+def inspect_file(file: str) -> dict:
+    size_bytes = os.path.getsize(file)
+    with fiona.open(file) as src:
+        feature_count = len(src)
+    return {"file": file, "size_bytes": size_bytes, "features": feature_count}
+
+
+def check_memory_and_merge(files: list, progress: Progress, num_workers: int) -> dict:
+    task = progress.add_task("Checking memory", total=len(files))
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {pool.submit(inspect_file, file): file for file in files}
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            progress.update(task, advance=1)
+
+    # Aggregate after all workers complete
+    total_features = sum(r["features"] for r in results)
+    total_size_bytes = sum(r["size_bytes"] for r in results)
+    estimated_ram_gb = (total_size_bytes * 4) / 1e9
+
+    if estimated_ram_gb > 900:
+        return {
+            "status": "aborted",
+            "total_features": total_features,
+            "total_size_gb": estimated_ram_gb,
+        }
+
+    return {
+        "status": "success",
+        "total_features": total_features,
+        "total_size_gb": estimated_ram_gb,
+    }
+
+
 def merge_vectors(
     input_dir: str,
     output_path: str,
-    raster_info: RasterInfo,
+    num_workers: int,
     progress: Progress,
-    task: TaskID,
-) -> None:
-    """
-    WILL WRITE DOCSTRING AFTER UPDATING THIS METHOD
-    """
-    out_ds = ogr.GetDriverByName("FlatGeobuf").CreateDataSource(output_path)
-    out_layer = out_ds.CreateLayer(
-        "merged_polygons", srs=raster_info.projection, geom_type=ogr.wkbPolygon
+    snap_tolerance: float = 1e-8,
+) -> dict:
+    tiles = [
+        os.path.join(input_dir, file)
+        for file in os.listdir(input_dir)
+        if file.endswith(".fgb")
+    ]
+
+    # Check memory constraints
+    mem_result = check_memory_and_merge(tiles, progress, num_workers)
+    if mem_result["status"] == "aborted":
+        return mem_result
+
+    # Load gdfs
+    load_task = progress.add_task("Loading tiles...", total=len(tiles))
+    gdfs = []
+    for t in tiles:
+        gdfs.append(gpd.read_file(t))
+        progress.update(load_task, advance=1)
+
+    gdf = pd.concat(gdfs, ignore_index=True)
+    gdf = gpd.GeoDataFrame(gdf, crs=gdfs[0].crs)
+
+    dask_gdf = dask_geopandas.from_geopandas(gdf, npartitions=num_workers)
+    dask_gdf["geometry"] = dask_gdf.geometry.buffer(snap_tolerance).buffer(
+        -snap_tolerance
     )
-    fieldname = ogr.FieldDefn("block_id", ogr.OFTInteger)
-    out_layer.CreateField(fieldname)
+    gdf = dask_gdf.compute()
 
-    for file in os.listdir(input_dir):
-        if file.endswith(".fgb"):
-            filepath = os.path.join(input_dir, file)
-            ds = ogr.Open(filepath)
-            lyr = ds.GetLayer()
-            for feat in lyr:
-                out_feat = ogr.Feature(out_layer.GetLayerDefn())
-                out_feat.SetGeometry(feat.GetGeometryRef().Clone())
-                fid = feat.GetField("block_id") - 1
-                fid = (fid - 1) if fid is not None else None
-                out_feat.SetField("block_id", fid)
-                out_layer.CreateFeature(out_feat)
-                out_feat = None
+    # Fix floating point gaps at tile seams
+    snap_task = progress.add_task("Snapping tile seams...", total=None)
+    gdf["geometry"] = gdf.geometry.buffer(snap_tolerance).buffer(-snap_tolerance)
+    gdf = gdf[gdf.geometry.is_valid & ~gdf.geometry.is_empty]
+    progress.update(snap_task, completed=1, total=1)
 
-            ds = None
+    # Build adjacency graph
+    graph_task = progress.add_task("Building adjacency graph...", total=len(gdf))
+    G = nx.Graph()
+    G.add_nodes_from(range(len(gdf)))
+    tree = gdf.sindex
+    for i, geom in enumerate(gdf.geometry):
+        candidates = list(tree.query(geom, predicate="touches"))
+        for j in candidates:
+            if i != j:
+                G.add_edge(i, j)
+        progress.update(graph_task, advance=1)
 
-        progress.update(task, advance=1)
+    # Dissolve each connected component
+    components = list(nx.connected_components(G))
+    dissolve_task = progress.add_task("Dissolving components...", total=len(components))
+    merged = []
+    for component in components:
+        idx = list(component)
+        subset = gdf.iloc[idx]
+        merged_geom = unary_union(subset.geometry)
+        merged.append(
+            {
+                "geometry": merged_geom,
+                "block_id": ",".join(subset["block_id"].astype(str).unique()),
+            }
+        )
+        progress.update(dissolve_task, advance=1)
 
-    out_ds = None
+    # Save
+    save_task = progress.add_task("Saving output...", total=None)
+    result = gpd.GeoDataFrame(merged, columns=["geometry", "block_id"], crs=gdf.crs)
+    result = result.explode(index_parts=False).reset_index(drop=True)
+    result.to_file(output_path, driver="FlatGeobuf")
+    progress.update(save_task, completed=1, total=1)
+
+    return {"status": "success"}
 
 
 # =============================================================================
@@ -631,13 +708,24 @@ def main():
     ) as progress:
 
         total_to_merge = os.listdir(output_block_dir)
-        if total_to_merge:
-            task = progress.add_task("Merging polygons...", total=len(total_to_merge))
 
+        if total_to_merge:
             output_vector_path = os.path.join(OUTPUT_DIR, "polygons.fgb")
-            merge_vectors(
-                output_block_dir, output_vector_path, raster_info, progress, task
-            )
+
+            try:
+                result = merge_vectors(
+                    output_block_dir, output_vector_path, N_WORKERS, progress
+                )
+                if result["status"] == "success":
+                    log.info("Merging complete")
+                elif result["status"] == "aborted":
+                    log.warning(
+                        f"Number of features was {result['total_features']}."
+                        f"Estimated GB to load was {result['total_size_gb']}."
+                        "Merging was therefore aborted"
+                    )
+            except Exception as exc:
+                log.error(f"Merging failed: {exc}")
 
     console.print("All polygons merged")
 
