@@ -7,12 +7,7 @@ from skimage.morphology import skeletonize
 from shapely.ops import unary_union
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from rich.console import Console
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TimeElapsedColumn,
-    MofNCompleteColumn,
-)
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, MofNCompleteColumn
 from dataclasses import dataclass, field
 import numpy as np
 import geopandas as gpd
