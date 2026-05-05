@@ -18,7 +18,7 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import networkx as nx
-import os, logging, fiona
+import os, logging
 
 # Env settings
 gdal.UseExceptions()
@@ -29,11 +29,11 @@ console = Console()
 # =============================================================================
 # GLOBALS
 # =============================================================================
-INPUT_RASTER_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/test_tiles2"
-OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/test_output"
-N_WORKERS = 1  # Number of CPUs to use
+INPUT_RASTER_DIR = "/gpfs/glad1/Exch/Andres_2023/by_Theo/REPROJECTED_3857_v2"
+OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/south_america_polygons"
+N_WORKERS = 200  # Number of CPUs to use
 GAP_THRESHOLD = 40  # Maximum size of gaps to close (in pixels)
-PROBABILITY_THRESHOLD = 15  # For linear features
+PROBABILITY_THRESHOLD = 15  # Minimum probability for linear features
 MIN_AREA = 80  # Minimum size of extracted polygons (in pixels)
 EPSG_CODE = 4326  # EPSG code for the final merged vector file
 
@@ -123,7 +123,7 @@ def load_raster(
 
     Args:
         input_raster_path (str): Path to raster
-        prob_threshold (int): Probability threshold for the block
+        prob_threshold (int): Probability threshold for the array
 
     Returns:
         tuple: Raster as numpy array, RasterInfo
@@ -190,13 +190,33 @@ def get_interior(closed_lines: np.ndarray, min_area: int) -> np.ndarray:
 
 
 def inspect_file(file: str) -> dict:
+    """Worker function for getting file size in parallel.
+
+    Args:
+        file (str): Path to file
+
+    Returns:
+        dict: File name and size in bytes
+    """
     size_bytes = os.path.getsize(file)
-    with fiona.open(file) as src:
-        feature_count = len(src)
-    return {"file": file, "size_bytes": size_bytes, "features": feature_count}
+
+    return {"file": file, "size_bytes": size_bytes}
 
 
 def check_memory_and_merge(files: list, progress: Progress, num_workers: int) -> dict:
+    """Uses ThreadPoolExecutor to find file size for a given list of files, and aborts
+    if the size is above 1 TB. Estimates the memory needed to merge the files by taking
+    input file size and multiplying by 18, which roughly accounts for the buffer and
+    graph steps in the merge_vectors function.
+
+    Args:
+        files (list): List of absolute paths to files
+        progress (Progress): Rich Progress bar
+        num_workers (int): Number of CPUs to use
+
+    Returns:
+        dict: Status and total size in GBs
+    """
     task = progress.add_task("Checking memory", total=len(files))
     results = []
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
@@ -207,20 +227,19 @@ def check_memory_and_merge(files: list, progress: Progress, num_workers: int) ->
             progress.update(task, advance=1)
 
     # Aggregate after all workers complete
-    total_features = sum(r["features"] for r in results)
     total_size_bytes = sum(r["size_bytes"] for r in results)
-    estimated_ram_gb = (total_size_bytes * 4) / 1e9
+    estimated_ram_gb = (total_size_bytes * 18) / 1e9
 
-    if estimated_ram_gb > 900:
+    if estimated_ram_gb > 1000:
         return {
             "status": "aborted",
-            "total_features": total_features,
             "total_size_gb": estimated_ram_gb,
         }
 
+    progress.console.print(f"Total size to merge is approx. {estimated_ram_gb:.2f} GB")
+
     return {
         "status": "success",
-        "total_features": total_features,
         "total_size_gb": estimated_ram_gb,
     }
 
@@ -233,6 +252,26 @@ def merge_vectors(
     crs: int = 3857,
     snap_tolerance: float = 1e-8,
 ) -> dict:
+    """Takes an input folder of vectors to merge and checks size, aborts if necessary,
+    loads all the gdfs into 1 gdf, buffers to account for polygons sharing a tile
+    boundary, and uses an adjacency graph to dissolve.
+
+    Args:
+        input_dir (str): Path to vector folder to merge
+        output_path (str): Path to output directory
+        num_workers (int): Number of CPUs to use when checking memory
+        progress (Progress): Rich Progress bar
+        crs (int, optional): EPSG code for reprojection. Defaults to 3857.
+        snap_tolerance (float, optional): Overlap distance for buffering.
+        Defaults to 1e-8.
+
+    Returns:
+        dict: Status as either:
+        status == empty: reason
+        status == aborted: total size gb (aborted if over 1000)
+        status == success
+    """
+
     tiles = [
         os.path.join(input_dir, file)
         for file in os.listdir(input_dir)
@@ -402,7 +441,7 @@ def find_enclosed_polygons(
     Returns:
         int: Number of enclosed polygons found
     """
-    # Get interior pixels within block & buffer
+    # Get interior pixels
     interior = get_interior(closed_lines, min_area)
 
     if interior.max() == 0:
@@ -443,7 +482,21 @@ def extract_polygons(
     prob_threshold: int,
     min_area: int,
 ) -> dict:
-    # Step 1: load block
+    """Main function for the workers to run in parallel. Loads the raster, closes gaps
+    between lines, then finds any enclosed polygons. Returns a dict with descriptive
+    status messaging.
+
+    Args:
+        output_dir (str): Path to output directory
+        input_raster_path (str): Path to input raster
+        gap_threshold (int): Maximum size of gaps to close (in pixels)
+        prob_threshold (int): Minimum probability for linear features thresholding
+        min_area (int): Minimum size of extracted polygons (in pixels)
+
+    Returns:
+        dict: Raster id, status, and number of extracted polygons
+    """
+    # Step 1: load raster
     raster_array, raster_info = load_raster(input_raster_path, prob_threshold)
 
     # Step 2: close gaps
@@ -533,7 +586,7 @@ def main():
 
     console.print(f"{len(completed_tiles)} rasters written successfully.")
 
-    # Merge block polygons
+    # Merge polygons
     with Progress(
         SpinnerColumn(),
         "[progress.description]{task.description}",
@@ -555,7 +608,6 @@ def main():
                     log.info("Merging complete")
                 elif result["status"] == "aborted":
                     log.warning(
-                        f"Number of features was {result['total_features']}."
                         f"Estimated GB to load was {result['total_size_gb']}."
                         f"Merging was therefore aborted"
                     )
