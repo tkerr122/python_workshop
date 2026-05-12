@@ -8,6 +8,7 @@
 | `copy_chm.py` | CLI utility to copy CHM files from one folder to another |
 | `copy_dtm.py` | CLI utility to copy DTM files from one folder to another |
 | `extract_polygons.py` | Extracts polygons from a linear features raster |
+| `extract_polygons_by_block.py` | Extracts polygons from a linear features raster using blocks and buffers |
 | `footprint.py` | CLI utility that gets footprints from a folder of rasters |
 | `get_planet_tiles.py` | CLI utility that finds which planet tiles a given raster/folder of rasters intersect with |
 | `gfc_create_training.py` | v1 of the gfc_extractor.py script, loops through polygons in shapefiles and extracts the GFC pixel values for training |
