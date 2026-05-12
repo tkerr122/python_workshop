@@ -20,21 +20,46 @@ gdal.UseExceptions()
 gdal.ConfigurePythonLogging(logger_name="log")
 console = Console()
 
+"""
+This script takes an input linear features probability raster and traces a 1-pixel-wide 
+line network from pixels above a probability threshold, then uses the gap threshold to 
+close any gaps between lines. Then it finds enclosed polygons formed throughout the line
+network, and writes them to disk. Lastly, it merges all the polygons into 1 vector file.
+----------------------------------------------------------------------------------------
+Arguments:
+INPUT_RASTER_DIR: folder of linear feature rasters to process
+OUTPUT_DIR: where to write the output merged vector, and folder of intermediate vectors
+N_WORKERS: number of CPUs to use for processing
+GAP_THRESHOLD: Maximum size of gaps to close (in pixels)
+PROBABILITY_THRESHOLD: Minimum probability for linear features
+MIN_AREA: Minimum size of extracted polygons (in pixels)
+EPSG_CODE: EPSG code for the final merged vector file
+----------------------------------------------------------------------------------------
+Notes:
+This script works best on a folder of rasters that cover one continuous extent. If the
+input rasters are not connected, the output merged raster will take longer to create.
+Also, if the input folder covers an extremely large extent, the merging process can take
+days to complete.
+If possible, use the output "block_polygons" folder for further processing, as creating
+the intermediate vectors without merging is extremely fast, only takes a few hours for
+all of South America.
+"""
 
-# =============================================================================
+
+# ======================================================================================
 # GLOBALS
-# =============================================================================
+# ======================================================================================
 INPUT_RASTER_DIR = "/gpfs/glad1/Exch/Andres_2023/by_Theo/REPROJECTED_3857_v2"
-OUTPUT_DIR = f"/gpfs/glad1/Theo/Data/Pastures_test/south_america_polygons"
-N_WORKERS = 200  # Number of CPUs to use
-GAP_THRESHOLD = 40  # Maximum size of gaps to close (in pixels)
-PROBABILITY_THRESHOLD = 15  # Minimum probability for linear features
-MIN_AREA = 80  # Minimum size of extracted polygons (in pixels)
-EPSG_CODE = 4326  # EPSG code for the final merged vector file
+OUTPUT_DIR = "/gpfs/glad1/Theo/Data/Pastures_test/south_america_polygons"
+N_WORKERS = 200
+GAP_THRESHOLD = 40
+PROBABILITY_THRESHOLD = 15
+MIN_AREA = 80
+EPSG_CODE = 4326
 
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Logging setup using Rich
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,9 +75,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
+# ======================================================================================
 # Custom class
-# =============================================================================
+# ======================================================================================
 @dataclass
 class RasterInfo:
     """Class to store raster info for later access. Derives certain fields when
@@ -81,9 +106,9 @@ class RasterInfo:
         self.ymin = self.ymax + self.pixel_height * self.ysize
 
 
-# =============================================================================
+# ======================================================================================
 # Utility functions
-# =============================================================================
+# ======================================================================================
 def get_raster_info(raster_path: str) -> RasterInfo:
     """Opens a raster using GDAL and gets columns (xsize), ysize (ysize),
     geotransform, and projection (as a spatial reference object)
@@ -332,9 +357,9 @@ def merge_vectors(
     return {"status": "success"}
 
 
-# =============================================================================
+# ======================================================================================
 # Driver functions
-# =============================================================================
+# ======================================================================================
 def close_gaps(raster_array: np.ndarray, gap_threshold: int) -> np.ndarray:
     """Uses the gap threshold and ndimage convolution and labeling to find and
     close gaps between skeleton endpoints.
@@ -467,9 +492,9 @@ def find_enclosed_polygons(
     return nb_polygons
 
 
-# =============================================================================
+# ======================================================================================
 # Extract polygons
-# =============================================================================
+# ======================================================================================
 def extract_polygons(
     output_dir: str,
     input_raster_path: str,
@@ -514,9 +539,9 @@ def extract_polygons(
     }
 
 
-# =============================================================================
+# ======================================================================================
 # MAIN
-# =============================================================================
+# ======================================================================================
 def main():
     # Make output folders
     output_tile_dir = os.path.join(OUTPUT_DIR, "raster_polygons")
